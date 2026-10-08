@@ -231,7 +231,7 @@ jobs:
             echo "- flavor：**standard**（minSdk 30 / targetSdk 37），未构建 low。"
             echo "- 目标机：vivo V2463A / Android 16 (SDK 36)。"
             echo "- 含四个修复：画中画过渡期重布局闪烁、虚拟屏 generation 同步、虚拟屏帧栅栏时间窗、网页附件选择桥 window.DSHA.pickFile、ADB wheel 站点目录 / PARENT_LINK。"
-            echo "- 签名：本仓库固定的 debug keystore（alias \`androiddebugkey\`）。"
+            echo "- 签名：本仓库固定的 debug keystore（alias \`AndroidDebugKey\`）。"
             echo "  - signer certificate SHA-256：\`${APK_CERT_SHA256}\`"
             echo "  - 该证书由 \`ci/debug.keystore\` 固定，之后用同一 workflow 构建的包**可直接覆盖安装本包**，无需卸载、无需重等首启环境解压。"
             echo "- 文件：\`${APK_FILE}\` · ${APK_BYTES} 字节"

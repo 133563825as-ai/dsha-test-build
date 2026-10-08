@@ -1,0 +1,89 @@
+name: Verify prebuilt debug APKs (fork CI)
+
+# Fork-only, no rebuild: pulls the artifacts produced by a previous run of
+# "Build installable debug APK (fork CI)" and reports authoritative
+# `aapt2 dump badging` / `apksigner verify` output plus sizes and digests.
+# Runs on x86_64 so Google's build-tools actually work.
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_ids:
+        description: Comma-separated Actions artifact ids to verify
+        required: false
+        default: "11547972824,11548167677"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install Android cmdline-tools and build-tools
+        run: |
+          set -euo pipefail
+          sdk_root="$HOME/android-sdk"
+          mkdir -p "$sdk_root/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
+          echo "0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8  /tmp/cmdline-tools.zip" | sha256sum -c -
+          unzip -q -o /tmp/cmdline-tools.zip -d "$sdk_root/cmdline-tools"
+          rm -rf "$sdk_root/cmdline-tools/latest"
+          mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          echo "$sdk_root/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$sdk_root/build-tools/36.0.0" >> "$GITHUB_PATH"
+      - name: Install build-tools 36.0.0
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "build-tools;36.0.0" "platforms;android-37.0"
+      - name: Download the artifacts built by the previous run
+        env:
+          ARTIFACT_IDS: ${{ inputs.artifact_ids }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl && cd dl
+          for id in ${ARTIFACT_IDS//,/ }; do
+            echo "== artifact $id"
+            curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -o "artifact-$id.zip" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/$id/zip"
+            mkdir -p "unpacked-$id"
+            unzip -q -o "artifact-$id.zip" -d "unpacked-$id"
+          done
+          find . -name '*.apk' -printf '%s\t%p\n' | sort -n
+      - name: aapt2 dump badging, apksigner, digests, zip contents
+        run: |
+          set -euo pipefail
+          {
+          echo "### APK files"
+          find dl -name '*.apk' -print0 | xargs -0 sha256sum
+          echo
+          for apk in $(find dl -name '*.apk' | sort); do
+            echo "================================================================"
+            echo "## $apk"
+            echo "bytes: $(stat -c%s "$apk")"
+            echo "--- aapt2 dump badging ---"
+            aapt2 dump badging "$apk" | sed -n '1,25p'
+            echo "--- apksigner verify --print-certs ---"
+            apksigner verify --print-certs --verbose "$apk" 2>&1 | sed -n '1,40p'
+            echo "--- zip entries (first 15) ---"
+            unzip -l "$apk" | sed -n '1,15p'
+            echo
+          done
+          } 2>&1 | tee apk-verification.txt
+      - name: Upload verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-verification-report
+          path: apk-verification.txt
+          if-no-files-found: warn
+          retention-days: 7

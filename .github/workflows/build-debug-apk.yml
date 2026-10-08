@@ -2,29 +2,55 @@ name: Build installable debug APK (fork CI)
 
 # FORK-ONLY harness. Lives in the temporary repo 133563825as-ai/dsha-test-build.
 # It never touches DSH-APP/DSHA (read-only checkout of a pinned commit).
+# See ci/FORK-NOTES.md for every deviation from the upstream package job.
 #
-# Deviations from the upstream package job (see ci/FORK-NOTES.md):
-#   1. source comes in as a patch applied on DSH-APP/DSHA@70e37a7;
+# Current shape (per user decision):
+#   * standard flavor only (target device: vivo V2463A / Android 16 / SDK 36,
+#     minSdk 30 is satisfied; the minSdk 23 "low" flavor is not built);
+#   * debug signing uses a keystore pinned in this repo, so every build is
+#     signed by the same certificate and later packages cover-install earlier
+#     ones instead of forcing an uninstall (which would cost another multi
+#     minute first-launch rootfs extraction);
+#   * the finished APK is published as a GitHub Release asset, so the phone
+#     browser can download it from a plain URL with no token;
+#   * a separate job runs the JVM unit tests for the fixes.
+#
+# Deviations from the upstream package job:
+#   1. source arrives as a patch applied on DSH-APP/DSHA@70e37a7;
 #   2. offline inputs are unpacked by ci/unpack-inputs.py instead of
 #      tools/ci-assets.py --url, because the stock script's verify_sources()
-#      is unsatisfiable with this bundle (descriptor pins the 304 MB source
-#      rootfs / does not register python-support.bin + adb-wheels.tar.gz);
+#      is unsatisfiable with this bundle (the descriptor pins the 304 MB
+#      source rootfs and does not register python-support.bin /
+#      adb-wheels.tar.gz);
 #   3. :app:verifyRuntimeDescriptorInputs and :app:prepareRuntimeDescriptor
 #      are excluded, for the same reason;
-#   4. no NDK is installed and no release keystore is used: debug builds are
-#      signed with the standard Android debug keystore, so the APK installs
-#      directly on a device.
+#   4. ci/patch-verification-metadata.py adds the one Linux-only artifact the
+#      upstream lock is missing (aapt2-*-linux.jar; the lock was generated on
+#      Windows), keeping dependency verification strict for everything else;
+#   5. no NDK is installed (no native compilation, jniLibs are prebuilt) and no
+#      release keystore is used.
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+    inputs:
+      release_tag:
+        description: GitHub Release tag to publish the standard APK under
+        required: true
+        default: test-1
+      patch_file:
+        description: Patch applied on top of the pinned upstream commit
+        required: true
+        default: ci/patches/dsha-four-fixes.patch
+      release_notes:
+        description: Extra text appended to the release notes
+        required: false
+        default: ""
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: build-debug-apk-${{ github.ref }}
+  group: fork-debug-apk-${{ github.ref }}-${{ inputs.release_tag }}
   cancel-in-progress: true
 
 env:
@@ -33,10 +59,14 @@ env:
   UPSTREAM_COMMIT: 70e37a7dbcae83b32fc92a8a37b33af88befc0e0
   INPUT_URL: https://github.com/133563825as-ai/dsha-test-build/releases/download/inputs/inputs.zip
   INPUT_SHA256: d28dd34804edc1623fab5760cf8dd7221ef17d974b6bf7792f3f5527a2a2e604
+  CMDLINE_TOOLS_URL: https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip
+  CMDLINE_TOOLS_SHA256: 0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8
+  # Certificate of the keystore pinned in this repo; every build must match it.
+  PINNED_CERT_SHA256: fc9f42df825a203f7d2b1e8913bda0353a47b386fcba4fb5718860e01ac39eae
 
 jobs:
   standard-debug:
-    name: assembleStandardDebug
+    name: assembleStandardDebug + release
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -54,11 +84,11 @@ jobs:
           git checkout -q --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
           git log --oneline -1
-      - name: Apply the four-fix patch
+      - name: Apply the patch
         working-directory: dsha
         run: |
           set -euo pipefail
-          git apply --verbose "${GITHUB_WORKSPACE}/ci/patches/dsha-four-fixes.patch"
+          git apply --verbose "${GITHUB_WORKSPACE}/${{ inputs.patch_file }}"
           git status --short
       # The checked-in lock was generated on Windows and pins only
       # aapt2-*-windows.jar (0 "-linux" artifacts in the whole file). On Linux,
@@ -79,6 +109,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
+      - name: Install the pinned debug keystore
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+          install -m 600 "${GITHUB_WORKSPACE}/ci/debug.keystore" "$HOME/.android/debug.keystore"
+          echo "keystore sha256: $(sha256sum "$HOME/.android/debug.keystore" | cut -d' ' -f1)"
+          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey \
+            | grep -iE "fingerprint|SHA256" || true
       # The ubuntu-24.04 image used here has no Android SDK on PATH at all
       # (sdkmanager -> command not found), so install cmdline-tools explicitly.
       - name: Install Android SDK command-line tools
@@ -86,16 +124,15 @@ jobs:
           set -euo pipefail
           sdk_root="$HOME/android-sdk"
           mkdir -p "$sdk_root/cmdline-tools"
-          curl -fsSL -o /tmp/cmdline-tools.zip \
-            "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
-          echo "0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8  /tmp/cmdline-tools.zip" \
-            | sha256sum -c -
+          curl -fsSL -o /tmp/cmdline-tools.zip "$CMDLINE_TOOLS_URL"
+          echo "${CMDLINE_TOOLS_SHA256}  /tmp/cmdline-tools.zip" | sha256sum -c -
           unzip -q -o /tmp/cmdline-tools.zip -d "$sdk_root/cmdline-tools"
           rm -rf "$sdk_root/cmdline-tools/latest"
           mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
           echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
           echo "$sdk_root/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$sdk_root/build-tools/36.0.0" >> "$GITHUB_PATH"
           ls -l "$sdk_root/cmdline-tools/latest/bin/sdkmanager"
       - name: Install Android SDK packages
         working-directory: dsha
@@ -120,12 +157,72 @@ jobs:
             -x :app:verifyRuntimeDescriptorInputs \
             -x :app:prepareRuntimeDescriptor \
             --no-daemon --max-workers=2 --stacktrace 2>&1 | tee "${GITHUB_WORKSPACE}/assemble-standard-debug.log"
+      - name: Collect APK facts and assert the pinned signer
+        if: success()
+        run: |
+          set -euo pipefail
+          apk=$(find dsha/app/build/outputs/apk/standard/debug -name '*.apk' -print -quit)
+          test -n "$apk"
+          echo "APK=$apk" >> "$GITHUB_ENV"
+          echo "APK_FILE=$(basename "$apk")" >> "$GITHUB_ENV"
+          echo "APK_BYTES=$(stat -c%s "$apk")" >> "$GITHUB_ENV"
+          echo "APK_SHA256=$(sha256sum "$apk" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          cert=$(apksigner verify --print-certs "$apk" \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr 'A-Z' 'a-z' | tr -d ':')
+          echo "APK_CERT_SHA256=$cert" >> "$GITHUB_ENV"
+          echo "apk            : $apk"
+          echo "bytes          : $(stat -c%s "$apk")"
+          echo "sha256         : $(sha256sum "$apk" | cut -d' ' -f1)"
+          echo "signer cert    : $cert"
+          echo "apksigner verify:"
+          apksigner verify --print-certs --verbose "$apk" 2>&1 | sed -n '1,12p'
+          if [ "$cert" != "${PINNED_CERT_SHA256}" ]; then
+            echo "::error::APK signer $cert != pinned ${PINNED_CERT_SHA256}"
+            exit 1
+          fi
+          echo "OK signed by the pinned keystore (cover-installable by later builds)"
       - name: Summarize output
         if: always()
         run: |
           find dsha/app/build/outputs/apk -name '*.apk' -printf '%s\t%p\n' 2>/dev/null | sort -n || true
           find dsha/app/build/outputs/apk -name '*.apk' -exec sha256sum {} + 2>/dev/null || true
-      - name: Upload APK or logs
+      - name: Publish the standard APK as a GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          EXTRA_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Fork 构建的**测试包**（不是 DSH-APP/DSHA 官方发布）。"
+            echo
+            echo "- flavor：**standard**（minSdk 30 / targetSdk 37），未构建 low。"
+            echo "- 目标机：vivo V2463A / Android 16 (SDK 36)。"
+            echo "- 含四个修复：画中画过渡期重布局闪烁、虚拟屏 generation 同步、虚拟屏帧栅栏时间窗、网页附件选择桥 window.DSHA.pickFile、ADB wheel 站点目录 / PARENT_LINK。"
+            echo "- 签名：本仓库固定的 debug keystore（alias \`androiddebugkey\`）。"
+            echo "  - signer certificate SHA-256：\`${APK_CERT_SHA256}\`"
+            echo "  - 该证书由 \`ci/debug.keystore\` 固定，之后用同一 workflow 构建的包**可直接覆盖安装本包**，无需卸载、无需重等首启环境解压。"
+            echo "- 文件：\`${APK_FILE}\` · ${APK_BYTES} 字节"
+            echo "- sha256：\`${APK_SHA256}\`"
+            echo "- 包名 \`com.dsh.client\`，与已装的 \`com.dsh.clienu\` 不同，可并存。"
+            echo "- 首次启动要从内置资产解压 Ubuntu 环境，需要几分钟。"
+            echo "- 直链：https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${APK_FILE}"
+            if [ -n "${EXTRA_NOTES}" ]; then
+              echo
+              echo "${EXTRA_NOTES}"
+            fi
+          } > notes.md
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "DSHA test build $TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "DSHA test build $TAG" \
+              --notes-file notes.md --latest=false
+          fi
+          gh release upload "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | .name + "  " + (.size|tostring)'
+      - name: Upload APK or logs as workflow artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -136,111 +233,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  low-debug:
-    name: assembleLowDebug
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    steps:
-      - name: Checkout fork harness
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Fetch upstream source at the pinned base commit (read-only, no token)
-        run: |
-          set -euo pipefail
-          git init -q dsha
-          cd dsha
-          git remote add origin "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch -q --depth=1 origin "${UPSTREAM_COMMIT}"
-          git checkout -q --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
-          git log --oneline -1
-      - name: Apply the four-fix patch
-        working-directory: dsha
-        run: |
-          set -euo pipefail
-          git apply --verbose "${GITHUB_WORKSPACE}/ci/patches/dsha-four-fixes.patch"
-      # The checked-in lock was generated on Windows and pins only
-      # aapt2-*-windows.jar (0 "-linux" artifacts in the whole file). On Linux,
-      # AGP resolves aapt2-*-linux.jar in a detached configuration and strict
-      # verification rejects it. Add exactly that one entry instead of
-      # weakening verification for the whole build.
-      - name: Add the Linux AAPT2 checksum to the dependency-verification lock
-        working-directory: dsha
-        run: python3 "${GITHUB_WORKSPACE}/ci/patch-verification-metadata.py"
-      - name: Verify toolchain against source configuration
-        id: toolchain
-        working-directory: dsha
-        run: python3 tools/ci-toolchain.py --github-output
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ steps.toolchain.outputs.java }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ steps.toolchain.outputs.node }}
-      # The ubuntu-24.04 image used here has no Android SDK on PATH at all
-      # (sdkmanager -> command not found), so install cmdline-tools explicitly.
-      - name: Install Android SDK command-line tools
-        run: |
-          set -euo pipefail
-          sdk_root="$HOME/android-sdk"
-          mkdir -p "$sdk_root/cmdline-tools"
-          curl -fsSL -o /tmp/cmdline-tools.zip \
-            "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
-          echo "0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8  /tmp/cmdline-tools.zip" \
-            | sha256sum -c -
-          unzip -q -o /tmp/cmdline-tools.zip -d "$sdk_root/cmdline-tools"
-          rm -rf "$sdk_root/cmdline-tools/latest"
-          mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
-          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
-          echo "$sdk_root/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          ls -l "$sdk_root/cmdline-tools/latest/bin/sdkmanager"
-      - name: Install Android SDK packages
-        working-directory: dsha
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;$(python3 tools/ci-toolchain.py --field androidPlatform)" \
-                     "build-tools;$(python3 tools/ci-toolchain.py --field buildTools)"
-          sdkmanager --list_installed
-      - name: Download and unpack the hosted offline inputs
-        working-directory: dsha
-        run: |
-          set -euo pipefail
-          python3 "${GITHUB_WORKSPACE}/ci/unpack-inputs.py" \
-            --url "$INPUT_URL" --sha256 "$INPUT_SHA256" --root .
-      - name: Assemble low debug APK
-        working-directory: dsha
-        run: |
-          set -euo pipefail
-          chmod +x gradlew
-          ./gradlew :app:assembleLowDebug \
-            -x :app:verifyRuntimeDescriptorInputs \
-            -x :app:prepareRuntimeDescriptor \
-            --no-daemon --max-workers=2 --stacktrace 2>&1 | tee "${GITHUB_WORKSPACE}/assemble-low-debug.log"
-      - name: Summarize output
-        if: always()
-        run: |
-          find dsha/app/build/outputs/apk -name '*.apk' -printf '%s\t%p\n' 2>/dev/null | sort -n || true
-          find dsha/app/build/outputs/apk -name '*.apk' -exec sha256sum {} + 2>/dev/null || true
-      - name: Upload APK or logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dsha-low-debug-apk
-          path: |
-            dsha/app/build/outputs/apk/**/*.apk
-            assemble-low-debug.log
-          if-no-files-found: warn
-          retention-days: 7
-
   fix-unit-tests:
-    name: unit tests for the four fixes
+    name: unit tests for the fixes
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    continue-on-error: true
     steps:
       - name: Checkout fork harness
         uses: actions/checkout@v4
@@ -256,16 +252,11 @@ jobs:
           git checkout -q --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
           git log --oneline -1
-      - name: Apply the four-fix patch
+      - name: Apply the patch
         working-directory: dsha
         run: |
           set -euo pipefail
-          git apply --verbose "${GITHUB_WORKSPACE}/ci/patches/dsha-four-fixes.patch"
-      # The checked-in lock was generated on Windows and pins only
-      # aapt2-*-windows.jar (0 "-linux" artifacts in the whole file). On Linux,
-      # AGP resolves aapt2-*-linux.jar in a detached configuration and strict
-      # verification rejects it. Add exactly that one entry instead of
-      # weakening verification for the whole build.
+          git apply --verbose "${GITHUB_WORKSPACE}/${{ inputs.patch_file }}"
       - name: Add the Linux AAPT2 checksum to the dependency-verification lock
         working-directory: dsha
         run: python3 "${GITHUB_WORKSPACE}/ci/patch-verification-metadata.py"
@@ -277,24 +268,20 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ steps.toolchain.outputs.java }}
-      # The ubuntu-24.04 image used here has no Android SDK on PATH at all
-      # (sdkmanager -> command not found), so install cmdline-tools explicitly.
       - name: Install Android SDK command-line tools
         run: |
           set -euo pipefail
           sdk_root="$HOME/android-sdk"
           mkdir -p "$sdk_root/cmdline-tools"
-          curl -fsSL -o /tmp/cmdline-tools.zip \
-            "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
-          echo "0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8  /tmp/cmdline-tools.zip" \
-            | sha256sum -c -
+          curl -fsSL -o /tmp/cmdline-tools.zip "$CMDLINE_TOOLS_URL"
+          echo "${CMDLINE_TOOLS_SHA256}  /tmp/cmdline-tools.zip" | sha256sum -c -
           unzip -q -o /tmp/cmdline-tools.zip -d "$sdk_root/cmdline-tools"
           rm -rf "$sdk_root/cmdline-tools/latest"
           mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
           echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
           echo "$sdk_root/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          ls -l "$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          echo "$sdk_root/build-tools/36.0.0" >> "$GITHUB_PATH"
       - name: Install Android SDK packages
         working-directory: dsha
         run: |
@@ -302,8 +289,7 @@ jobs:
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platforms;$(python3 tools/ci-toolchain.py --field androidPlatform)" \
                      "build-tools;$(python3 tools/ci-toolchain.py --field buildTools)"
-          sdkmanager --list_installed
-      - name: Run debug unit tests without offline package generation
+      - name: Run the JVM unit tests for the fixes
         working-directory: dsha
         run: |
           set -euo pipefail

@@ -29,7 +29,8 @@ concurrency:
 
 env:
   UPSTREAM_REPO: DSH-APP/DSHA
-  UPSTREAM_COMMIT: 70e37a7
+  # Must be the full 40-char SHA: actions/checkout treats a short SHA as a branch name.
+  UPSTREAM_COMMIT: 70e37a7dbcae83b32fc92a8a37b33af88befc0e0
   INPUT_URL: https://github.com/133563825as-ai/dsha-test-build/releases/download/inputs/inputs.zip
   INPUT_SHA256: d28dd34804edc1623fab5760cf8dd7221ef17d974b6bf7792f3f5527a2a2e604
 
@@ -43,14 +44,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Checkout upstream source at the pinned base commit
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ env.UPSTREAM_COMMIT }}
-          path: dsha
-          fetch-depth: 1
-          persist-credentials: false
+      - name: Fetch upstream source at the pinned base commit (read-only, no token)
+        run: |
+          set -euo pipefail
+          git init -q dsha
+          cd dsha
+          git remote add origin "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch -q --depth=1 origin "${UPSTREAM_COMMIT}"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
+          git log --oneline -1
       - name: Apply the four-fix patch
         working-directory: dsha
         run: |
@@ -115,14 +118,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Checkout upstream source at the pinned base commit
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ env.UPSTREAM_COMMIT }}
-          path: dsha
-          fetch-depth: 1
-          persist-credentials: false
+      - name: Fetch upstream source at the pinned base commit (read-only, no token)
+        run: |
+          set -euo pipefail
+          git init -q dsha
+          cd dsha
+          git remote add origin "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch -q --depth=1 origin "${UPSTREAM_COMMIT}"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
+          git log --oneline -1
       - name: Apply the four-fix patch
         working-directory: dsha
         run: |
@@ -187,14 +192,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Checkout upstream source at the pinned base commit
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ env.UPSTREAM_COMMIT }}
-          path: dsha
-          fetch-depth: 1
-          persist-credentials: false
+      - name: Fetch upstream source at the pinned base commit (read-only, no token)
+        run: |
+          set -euo pipefail
+          git init -q dsha
+          cd dsha
+          git remote add origin "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch -q --depth=1 origin "${UPSTREAM_COMMIT}"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
+          git log --oneline -1
       - name: Apply the four-fix patch
         working-directory: dsha
         run: |

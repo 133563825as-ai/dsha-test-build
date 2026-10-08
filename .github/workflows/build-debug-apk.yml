@@ -71,13 +71,32 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
-      - name: Android SDK
+      # The ubuntu-24.04 image used here has no Android SDK on PATH at all
+      # (sdkmanager -> command not found), so install cmdline-tools explicitly.
+      - name: Install Android SDK command-line tools
+        run: |
+          set -euo pipefail
+          sdk_root="$HOME/android-sdk"
+          mkdir -p "$sdk_root/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
+          echo "0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8  /tmp/cmdline-tools.zip" \
+            | sha256sum -c -
+          unzip -q -o /tmp/cmdline-tools.zip -d "$sdk_root/cmdline-tools"
+          rm -rf "$sdk_root/cmdline-tools/latest"
+          mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          echo "$sdk_root/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          ls -l "$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+      - name: Install Android SDK packages
         working-directory: dsha
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platforms;$(python3 tools/ci-toolchain.py --field androidPlatform)" \
                      "build-tools;$(python3 tools/ci-toolchain.py --field buildTools)"
+          sdkmanager --list_installed
       - name: Download and unpack the hosted offline inputs
         working-directory: dsha
         run: |
@@ -144,13 +163,32 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.toolchain.outputs.node }}
-      - name: Android SDK
+      # The ubuntu-24.04 image used here has no Android SDK on PATH at all
+      # (sdkmanager -> command not found), so install cmdline-tools explicitly.
+      - name: Install Android SDK command-line tools
+        run: |
+          set -euo pipefail
+          sdk_root="$HOME/android-sdk"
+          mkdir -p "$sdk_root/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
+          echo "0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8  /tmp/cmdline-tools.zip" \
+            | sha256sum -c -
+          unzip -q -o /tmp/cmdline-tools.zip -d "$sdk_root/cmdline-tools"
+          rm -rf "$sdk_root/cmdline-tools/latest"
+          mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          echo "$sdk_root/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          ls -l "$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+      - name: Install Android SDK packages
         working-directory: dsha
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platforms;$(python3 tools/ci-toolchain.py --field androidPlatform)" \
                      "build-tools;$(python3 tools/ci-toolchain.py --field buildTools)"
+          sdkmanager --list_installed
       - name: Download and unpack the hosted offline inputs
         working-directory: dsha
         run: |
@@ -215,13 +253,32 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ steps.toolchain.outputs.java }}
-      - name: Android SDK
+      # The ubuntu-24.04 image used here has no Android SDK on PATH at all
+      # (sdkmanager -> command not found), so install cmdline-tools explicitly.
+      - name: Install Android SDK command-line tools
+        run: |
+          set -euo pipefail
+          sdk_root="$HOME/android-sdk"
+          mkdir -p "$sdk_root/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
+          echo "0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8  /tmp/cmdline-tools.zip" \
+            | sha256sum -c -
+          unzip -q -o /tmp/cmdline-tools.zip -d "$sdk_root/cmdline-tools"
+          rm -rf "$sdk_root/cmdline-tools/latest"
+          mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          echo "$sdk_root/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          ls -l "$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+      - name: Install Android SDK packages
         working-directory: dsha
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platforms;$(python3 tools/ci-toolchain.py --field androidPlatform)" \
                      "build-tools;$(python3 tools/ci-toolchain.py --field buildTools)"
+          sdkmanager --list_installed
       - name: Run debug unit tests without offline package generation
         working-directory: dsha
         run: |

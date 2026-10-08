@@ -1,0 +1,1441 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index b2e29af..a8885eb 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -134,7 +134,7 @@ bash build.sh :app:testStandardDebugUnitTest   # 全量单测
+ 
+ - **独立应急 DSH**：`recovery/` 不经过正式环境的迁移、数据绑定及全局启动锁；归档由 `tools/recovery-runtime/lock.json` 单独锁定；应急 Profile 仅有五个受控修复工具。不能用「原生安全 Profile」替代独立运行根。`RecoveryRepairBroker` 的 HTTP 接口不能确认写入：原生确认绑定候选、源摘要及数据代次，再经停止屏障和宿主事务。
+ - 应急资产去重：`recovery-asset-locations.json` 仅映射物理位置；仅当正式归档 SHA 与独立应急锁完全相同才共用包内字节，解压运行根仍独立，不读取正式 rootfs 作为救援依赖。
+-- **虚拟屏**（Standard，API 30+）：App 持有认证连接和心跳；每次输入必须带最新 frameSeq（`util/VirtualScreenPolicy.fresh`）；动作失败**绝不换通道重放**。
++- **虚拟屏**（Standard，API 30+）：App 持有认证连接和心跳；依赖坐标的输入（tap/swipe/touch DOWN）必须带 `util/VirtualScreenPolicy.recent` 有界时间窗内的 frameSeq（容忍光标闪烁的少量帧前进），key/type/node/editor 等非坐标动作不受帧栅栏限制；动作失败**绝不换通道重放**。
+ - **麦克风**：清单同时声明 `RECORD_AUDIO` 与 `MODIFY_AUDIO_SETTINGS`；由 `BrowserMicrophone` 按网页请求申请，不能在普通启动时预授权；只放行当前本机页面的纯音频请求，摄像头 / 屏幕音频拒绝；旧回调不能批准新页。
+ - **设备验收经验**：`uiautomator dump` 会抑制其他无障碍服务；截图授权绑定 DSH generation，停止 / 断连 / 撤销后失效；截图存应用私有 Pictures/DSHA，无需所有文件访问；PiP 可能盖住底部控件，自动化必须核对实际可见区域与屏幕方向；截图 / 读屏不可将敏感值写入公开取证文件。
+ - Shizuku 必须注册 `rikka.shizuku.ShizukuProvider`；标准版 13.1.5 / 兼容版 12.2.0（不用 overrideLibrary 掩盖 minSdk 24）。回调严格核对管理器 UID、Binder 描述符、单次请求与超时。
+diff --git a/app/src/main/assets/web-integration/files.js b/app/src/main/assets/web-integration/files.js
+new file mode 100644
+index 0000000..d024732
+--- /dev/null
++++ b/app/src/main/assets/web-integration/files.js
+@@ -0,0 +1,109 @@
++(function () {
++  // 由原生 WebMessageListener 按精确来源注入；外部页、iframe 与普通浏览器不启用。
++  if (window !== window.top || !window.DshaFiles || window.__dshaFilesInstalled) return;
++  window.__dshaFilesInstalled = true;
++  const pending = new Map();
++  const api = window.DSHA || (window.DSHA = {});
++  function request(action, file) {
++    if (!(file instanceof Blob)) return Promise.reject(new TypeError('Expected a File or Blob'));
++    const limit = action === 'share' ? 32 * 1024 * 1024 : 2147483648;
++    if (file.size > limit) return Promise.reject(new Error('File is too large'));
++    if (pending.size) return Promise.reject(new Error('A file transfer is already pending'));
++    const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
++    const url = URL.createObjectURL(file);
++    return new Promise((resolve, reject) => {
++      pending.set(id, {resolve, reject, url});
++      try {
++        DshaFiles.postMessage(JSON.stringify({id, action, url, bytes: file.size,
++          name: file.name || 'download.bin', mime: file.type || 'application/octet-stream'}));
++      } catch (error) { pending.delete(id); URL.revokeObjectURL(url); reject(error); }
++    });
++  }
++  DshaFiles.onmessage = event => {
++    let result;
++    try { result = JSON.parse(event.data); } catch (_) { return; }
++    const task = pending.get(result.id);
++    if (!task) return;
++    pending.delete(result.id);
++    if (task.url) URL.revokeObjectURL(task.url);
++    // 附件选择桥是反向的一路：原生回的是文件清单，而不是 transfer 的成败。
++    if (task.kind === 'pick') {
++      if (!result.ok) { task.reject(new Error(result.detail || 'File pick failed')); return; }
++      if (!Array.isArray(result.files)) { task.reject(new Error('Invalid pick result')); return; }
++      let files;
++      try { files = result.files.map(pickFileFrom); } catch (error) { task.reject(error); return; }
++      task.resolve(files);
++      return;
++    }
++    if (result.ok) task.resolve({status: result.detail});
++    else { const error = new Error(result.detail || 'File transfer failed');
++      if (result.detail === 'AbortError') error.name = 'AbortError';
++      task.reject(error); }
++  };
++  api.canShareFile = file => file instanceof Blob && file.size <= 32 * 1024 * 1024;
++  api.shareFile = file => request('share', file);
++  api.saveFile = file => request('save', file);
++
++  // —— 附件选择桥（pickFile）——
++  // 与 share/save 方向相反：原生弹系统「打开方式」，用户选完把内容回传，这里组装成真正的 File。
++  // 插件侧用 `instanceof File` 过滤，回字符串或 Blob 都不算数；取消必须 resolve 空数组，
++  // 因为插件把 reject 当成「桥坏了」，会立刻回落宿主 input 再弹一次。
++  /** 超时（原生回执丢失）按取消结算：宁可什么都不做，也不在可能还开着的选择器之后再弹一个。 */
++  const PICK_TIMEOUT_MS = 10 * 60 * 1000;
++  /** accept 白名单：只收 `type/subtype` 与通配，长度与条数都有界。 */
++  function pickAccept(value) {
++    if (!Array.isArray(value)) return [];
++    const list = [];
++    for (const item of value) {
++      if (typeof item !== 'string') continue;
++      const accept = item.trim();
++      if (!accept || accept.length > 128) continue;
++      if (accept !== '*/*' && !/^[-\w.+]+\/(\*|[-\w.+]+)$/.test(accept)) continue;
++      if (list.indexOf(accept) < 0) list.push(accept);
++      if (list.length >= 16) break;
++    }
++    return list;
++  }
++  /** 原生 base64 回执 → File。不用 `fetch('data:…')`：那条路会被页面的 CSP connect-src 拦。 */
++  function pickFileFrom(entry) {
++    if (!entry || typeof entry !== 'object') throw new Error('Invalid file entry');
++    if (typeof entry.base64 !== 'string' || !entry.base64) throw new Error('Missing file payload');
++    const name = typeof entry.name === 'string' && entry.name ? entry.name : 'attachment.bin';
++    const mime = typeof entry.mime === 'string' && entry.mime ? entry.mime : 'application/octet-stream';
++    const binary = atob(entry.base64);
++    const bytes = new Uint8Array(binary.length);
++    for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
++    return new File([bytes], name, {type: mime});
++  }
++  api.pickFile = options => {
++    const settings = options && typeof options === 'object' ? options : {};
++    if (pending.size) return Promise.reject(new Error('A file transfer is already pending'));
++    const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
++    return new Promise((resolve, reject) => {
++      const timer = setTimeout(() => {
++        if (pending.delete(id)) resolve([]);
++      }, PICK_TIMEOUT_MS);
++      pending.set(id, {kind: 'pick', resolve, reject, url: null, timer});
++      try {
++        DshaFiles.postMessage(JSON.stringify({id, action: 'pick', accept: pickAccept(settings.accept),
++          multiple: settings.multiple === true,
++          title: typeof settings.title === 'string' ? settings.title.slice(0, 80) : ''}));
++      } catch (error) { pending.delete(id); clearTimeout(timer); reject(error); }
++    });
++  };
++
++  // 166 原始实现里这里还有一段 `a[download]` 点击拦截器（preventDefault → fetch → saveFile）。
++  // 它依赖原生 share/save 已经落地；本分支所在的是还没有原生 share/save 的 162 树，整段引入会把
++  // 既有 blob 下载（WebBlobDownload + DownloadListener）打断成一次失败的 alert，所以此处不带它。
++  // 合到 166 时必须保留 166 原文里的那一段。
++  window.addEventListener('pagehide', () => {
++    for (const task of pending.values()) {
++      if (task.url) URL.revokeObjectURL(task.url);
++      if (task.timer) clearTimeout(task.timer);
++      // 选择器可能还开着，但页面已经不留了：按「取消」结算，不让插件回落到宿主 input。
++      if (task.kind === 'pick') task.resolve([]);
++      else task.reject(new Error('Page closed'));
++    }
++    pending.clear();
++  });
++})();
+diff --git a/app/src/main/java/com/deepseekharness/app/HttpShellService.java b/app/src/main/java/com/deepseekharness/app/HttpShellService.java
+index d737b7f..86b7a35 100644
+--- a/app/src/main/java/com/deepseekharness/app/HttpShellService.java
++++ b/app/src/main/java/com/deepseekharness/app/HttpShellService.java
+@@ -1205,33 +1205,36 @@ public final class HttpShellService {
+                   && !controller.isStopping()
+                   && !controller.isUserStopped();
+       if (!live.getAsBoolean()) return "{\"ok\":false,\"error\":\"SCREEN_RUN_CHANGED\"}";
++      // create 会释放并重建 VirtualDisplay，动作成功后旧 target 必然不再匹配：
++      // 与 launch 同列为例外，否则已经生效的远端结果会被改写成 SCREEN_TARGET_CHANGED。
++      boolean identityChanging = operation.equals("launch") || operation.equals("create");
+       java.util.function.Supplier<String> action =
+           () -> {
+             if (!live.getAsBoolean()
+                 || target != null
+-                    && !operation.equals("launch")
++                    && !identityChanging
+                     && !DshaAccessibilityService.matchesTarget(target))
+               return "{\"ok\":false,\"error\":\"SCREEN_TARGET_CHANGED\"}";
+             String result =
+                 com.deepseekharness.app.vscreen.VirtualScreenManager.from(ctx)
+                     .withBridgeTarget(
+-                        operation.equals("launch") ? "" : pkg,
++                        identityChanging ? "" : pkg,
+                         () ->
+                             live.getAsBoolean()
+                                 && (target == null
+-                                    || operation.equals("launch")
++                                    || identityChanging
+                                     || DshaAccessibilityService.matchesTarget(target)),
+                         () ->
+                             com.deepseekharness.app.vscreen.VirtualScreenManager.from(ctx)
+                                 .bridge(request));
+             if (!live.getAsBoolean()
+                 || target != null
+-                    && !operation.equals("launch")
++                    && !identityChanging
+                     && !DshaAccessibilityService.matchesTarget(target))
+               return "{\"ok\":false,\"error\":\"SCREEN_TARGET_CHANGED\"}";
+             return result;
+           };
+-      return target != null && !operation.equals("launch")
++      return target != null && !identityChanging
+           ? DshaAccessibilityService.runAuthorized(target, live, action)
+           : action.get();
+     } catch (Throwable error) {
+diff --git a/app/src/main/java/com/deepseekharness/app/backup/AndroidBackupFileSystem.java b/app/src/main/java/com/deepseekharness/app/backup/AndroidBackupFileSystem.java
+index ce0054e..281fd7c 100644
+--- a/app/src/main/java/com/deepseekharness/app/backup/AndroidBackupFileSystem.java
++++ b/app/src/main/java/com/deepseekharness/app/backup/AndroidBackupFileSystem.java
+@@ -31,9 +31,10 @@ public class AndroidBackupFileSystem implements BackupFileSystem {
+                   i == parts.length - 1 ? flags : O_PATH | O_CLOEXEC | OsConstants.O_NOFOLLOW,
+                   i == parts.length - 1 ? mode : 0);
+         }
+-        if (i < parts.length - 1 && !OsConstants.S_ISDIR(Os.fstat(next).st_mode)) {
++        StructStat node = Os.fstat(next);
++        if (i < parts.length - 1 && !OsConstants.S_ISDIR(node.st_mode)) {
+           Os.close(next);
+-          throw new IOException("PARENT_LINK");
++          throw refusal(absolute, String.valueOf(i + 1), node);
+         }
+         Os.close(directory);
+         directory = next;
+@@ -95,12 +96,25 @@ public class AndroidBackupFileSystem implements BackupFileSystem {
+     T run(String path) throws IOException, ErrnoException;
+   }
+ 
++  /**
++   * 逐级 O_NOFOLLOW 校验只接受真目录；平台路径别名或子路径链接会让上级目录不是目录。文案里只带
++   * 「哪一级、哪种类型」，完整路径写开发者日志，避免把用户路径放进对外文本。
++   */
++  private static IOException refusal(File path, String level, StructStat node) {
++    String type = OsConstants.S_ISLNK(node.st_mode) ? "LINK" : "NON_DIRECTORY";
++    android.util.Log.w(
++        "DshaBackupFs", "PARENT_LINK " + path.getPath() + " level=" + level + " " + type);
++    return new IOException("PARENT_LINK#" + level + ":" + type);
++  }
++
+   private static <T> T atParent(File file, AtParent<T> action) throws IOException, ErrnoException {
+     FileDescriptor parent =
+         anchored(
+             file.getAbsoluteFile().getParentFile(), O_PATH | O_CLOEXEC | OsConstants.O_NOFOLLOW, 0);
+     try {
+-      if (!OsConstants.S_ISDIR(Os.fstat(parent).st_mode)) throw new IOException("PARENT_LINK");
++      StructStat node = Os.fstat(parent);
++      if (!OsConstants.S_ISDIR(node.st_mode))
++        throw refusal(file.getAbsoluteFile().getParentFile(), "parent", node);
+       try (ParcelFileDescriptor handle = ParcelFileDescriptor.dup(parent)) {
+         return action.run("/proc/self/fd/" + handle.getFd() + "/" + file.getName());
+       }
+diff --git a/app/src/main/java/com/deepseekharness/app/bridge/AdbBridge.java b/app/src/main/java/com/deepseekharness/app/bridge/AdbBridge.java
+index aca2b0b..ba61bb0 100644
+--- a/app/src/main/java/com/deepseekharness/app/bridge/AdbBridge.java
++++ b/app/src/main/java/com/deepseekharness/app/bridge/AdbBridge.java
+@@ -272,25 +272,40 @@ public final class AdbBridge {
+ 
+   private static String extractWheelsOwned(ProotBootstrap proot) {
+     try {
++      // 只规范化框架提供的应用根：/data/data 与 /data/user/0 这类平台别名会在逐级 O_NOFOLLOW 校验里
++      // 被判成父目录链接（PARENT_LINK）。rootfs 内部的子路径仍由文件系统逐级拒绝链接。
++      File rootfs = proot.getRootfsDir().getCanonicalFile();
+       return AdbWheelCache.install(
+           new com.deepseekharness.app.backup.AndroidBackupFileSystem(),
+-          new File(proot.getRootfsDir(), "root/.dsh/wheels"),
+-          new File(proot.getRootfsDir(), "usr/lib/python3/dist-packages"),
+-          proot.getRootfsDir().getParentFile());
++          new File(rootfs, "root/.dsh/wheels"),
++          AdbWheelCache.siteDir(rootfs),
++          rootfs.getParentFile());
+     } catch (Exception e) {
+-      return "WHEELS_EXTRACT_FAIL: " + SensitiveData.redact(String.valueOf(e));
++      return "WHEELS_EXTRACT_FAIL: " + SensitiveData.redact(String.valueOf(e)) + wheelPathHint(e);
+     }
+   }
+ 
++  /** 上级路径含符号链接或非目录项时给一句可读说明；级别与类型在异常文本和开发者日志里。 */
++  private static String wheelPathHint(Exception e) {
++    return String.valueOf(e).contains("PARENT_LINK")
++        ? com.deepseekharness.app.util.UiText.text("（wheel 目录的上级路径含符号链接或非目录项，已保留原状未写入）")
++        : "";
++  }
++
+   private static boolean wrapperPresent(ProotBootstrap proot) {
+     return proot.bundledDeviceScriptsMatch();
+   }
+ 
+   /** APK 归档先进入临时目录，再按名称补缺；不覆盖恢复出来的 wheel 或缓存归档。 */
+   private static String injectWheels(Context ctx, ProotBootstrap proot) {
+-    File stage = new File(ctx.getCacheDir(), "adb-wheel-bundle-" + java.util.UUID.randomUUID());
++    File stage;
+     String boundary;
+     try {
++      // 缓存目录同样是框架提供的应用根，别名（/data/data ↔ /data/user/0）先归一化。
++      stage =
++          new File(
++              ctx.getCacheDir().getCanonicalFile(),
++              "adb-wheel-bundle-" + java.util.UUID.randomUUID());
+       if (!stage.mkdir())
+         throw new java.io.IOException(
+             com.deepseekharness.app.util.UiText.text("无法创建 APK wheel 临时目录"));
+@@ -315,18 +330,20 @@ public final class AdbBridge {
+       if (!bundled.mkdir())
+         throw new java.io.IOException(com.deepseekharness.app.util.UiText.text("无法创建 wheel 解包目录"));
+       TarGzipExtractor.extract(archive, bundled);
++      File rootfs = proot.getRootfsDir().getCanonicalFile();
+       AdbWheelCache.Merge report =
+           AdbWheelCache.fillMissing(
+               new com.deepseekharness.app.backup.AndroidBackupFileSystem(),
+               bundled,
+-              new File(proot.getRootfsDir(), "root/.dsh/wheels"),
++              new File(rootfs, "root/.dsh/wheels"),
+               archive,
+-              new File(proot.getRootfsDir(), "root/.dsh/adb-wheels.tar.gz"));
++              new File(rootfs, "root/.dsh/adb-wheels.tar.gz"));
+       result = report.message();
+     } catch (Exception e) {
+       result =
+           com.deepseekharness.app.util.UiText.format(
+-              "WHEELS_INJECT_FAIL: %s；已有缓存原样保留，未用 APK 覆盖", SensitiveData.redact(String.valueOf(e)));
++              "WHEELS_INJECT_FAIL: %s；已有缓存原样保留，未用 APK 覆盖%s",
++              SensitiveData.redact(String.valueOf(e)), wheelPathHint(e));
+     } finally {
+       try {
+         AdbWheelCache.removeStage(stage, boundary);
+diff --git a/app/src/main/java/com/deepseekharness/app/ui/PictureInPictureActivity.java b/app/src/main/java/com/deepseekharness/app/ui/PictureInPictureActivity.java
+index dcb6f2f..48cf80e 100644
+--- a/app/src/main/java/com/deepseekharness/app/ui/PictureInPictureActivity.java
++++ b/app/src/main/java/com/deepseekharness/app/ui/PictureInPictureActivity.java
+@@ -280,9 +280,14 @@ public abstract class PictureInPictureActivity extends AppCompatActivity {
+   @Override
+   protected void onUserLeaveHint() {
+     super.onUserLeaveHint();
+-    // Android 8–11 没有 auto-enter；回桌面或切换应用时在这里进入。
+-    if (Build.VERSION.SDK_INT >= 26 && Build.VERSION.SDK_INT < 31) enterIfAllowed();
+-    else if (pictureFrame != null && mayEnter()) pictureFrame.freezeViewport();
++    // Android 8–11 没有 auto-enter；回桌面或切换应用时在这里进入（enterIfAllowed 内部自会冻结）。
++    if (Build.VERSION.SDK_INT >= 26 && Build.VERSION.SDK_INT < 31) {
++      enterIfAllowed();
++      return;
++    }
++    // Android 12+ 是否真的进小窗由系统 auto-enter 决定：这里不能再用 mayEnter()（它要求网页已就绪、
++    // 系统开关已开）当门槛，否则过渡期漏掉冻结，WebView 会在收缩中的小窗窗口里被重排。
++    if (Build.VERSION.SDK_INT >= 31 && pictureFrame != null) pictureFrame.freezeViewport();
+   }
+ 
+   @Override
+diff --git a/app/src/main/java/com/deepseekharness/app/ui/PictureInPictureFrame.java b/app/src/main/java/com/deepseekharness/app/ui/PictureInPictureFrame.java
+index 0e7ee34..e757cf1 100644
+--- a/app/src/main/java/com/deepseekharness/app/ui/PictureInPictureFrame.java
++++ b/app/src/main/java/com/deepseekharness/app/ui/PictureInPictureFrame.java
+@@ -19,6 +19,10 @@ final class PictureInPictureFrame extends FrameLayout {
+    * repeatedly (the high-frequency PiP flicker reported on the tablet).
+    * Keep one logical viewport for the whole PiP session and only scale the
+    * already laid-out child into the current bounds.
++   *
++   * 过渡期（compact 尚未置位、只冻结了视口）必须同样跳过 super 的 measure/layout：那时窗口已在
++   * 收缩，若仍按小窗物理尺寸测量子视图，Chromium 会把整页重排到更窄的 CSS 视口，再在小窗里被拉回，
++   * 就是小窗下中部看到的闪烁。
+    */
+   private int compactViewportWidth = -1, compactViewportHeight = -1;
+   private int measuredChildWidth = -1, measuredChildHeight = -1;
+@@ -44,14 +48,21 @@ final class PictureInPictureFrame extends FrameLayout {
+   void setPictureLayout(String value) {
+     if (!pictureLayout.equals(value)) {
+       pictureLayout = value;
+-      if (compact) captureCompactViewport();
++      // 冻结期与 compact 一样要重取会话冻结视口，否则手动切换横竖屏后仍按旧视口绘制。
++      if (compact || frozen) captureCompactViewport();
+       resetGeometryCache();
+       requestLayout();
+     }
+   }
+ 
+   void freezeViewport() {
++    if (frozen) return;
+     frozen = true;
++    // 进入小窗前（auto-enter）窗口还是完整的：此刻就冻结逻辑视口，过渡期不再按收缩中的
++    // 小窗尺寸重排；缺视口时按当前窗口兜底。
++    if (compactViewportWidth <= 0 || compactViewportHeight <= 0) captureCompactViewport();
++    resetGeometryCache();
++    requestLayout();
+   }
+ 
+   boolean isFrozen() {
+@@ -86,20 +97,40 @@ final class PictureInPictureFrame extends FrameLayout {
+     return viewportHeight > 0 ? viewportHeight : getHeight();
+   }
+ 
++  /** 小窗与过渡期一律读会话冻结视口，系统参数（宽高比、切换图标）才不会随窗口回调抖动。 */
+   int[] pictureViewport() {
++    if (compact || frozen) {
++      if (compactViewportWidth > 0 && compactViewportHeight > 0)
++        return new int[] {compactViewportWidth, compactViewportHeight};
++    }
+     return PictureInPicturePolicy.viewport(viewportWidth(), viewportHeight(), pictureLayout);
+   }
+ 
+-  private int[] drawingViewport(int width, int height) {
+-    if (compact && compactViewportWidth > 0 && compactViewportHeight > 0)
+-      return new int[] {compactViewportWidth, compactViewportHeight};
+-    return PictureInPicturePolicy.fittedViewport(
+-        viewportWidth(), viewportHeight(), width, height, pictureLayout);
++  /** 冻结绘制是否有可信视口：优先会话冻结视口，否则要有一份完整的窗口逻辑视口。 */
++  private boolean frozenBasisReady() {
++    if (compactViewportWidth > 0 && compactViewportHeight > 0) return true;
++    return viewportWidth > 0 && viewportHeight > 0;
++  }
++
++  /** 小窗 / 过渡期的绘制视口：只读会话冻结视口，绝不跟随收缩中的窗口尺寸。 */
++  private int[] drawingViewport() {
++    return PictureInPicturePolicy.frozenViewport(
++        compactViewportWidth,
++        compactViewportHeight,
++        viewportWidth(),
++        viewportHeight(),
++        pictureLayout);
+   }
+ 
+   private void captureCompactViewport() {
+     int width = viewportWidth();
+     int height = viewportHeight();
++    // 小窗退出后的窗口回调可能已把逻辑视口覆盖成小窗物理尺寸（如 654×1440）；明显小于当前窗口的
++    // 值不采纳，改用当前窗口尺寸，否则冻结后 Chromium 会把整页重排到更窄的 CSS 视口。
++    if (PictureInPicturePolicy.smallerThanWindow(width, height, getWidth(), getHeight())) {
++      width = getWidth();
++      height = getHeight();
++    }
+     int[] preferred = PictureInPicturePolicy.viewport(width, height, pictureLayout);
+     compactViewportWidth = preferred[0];
+     compactViewportHeight = preferred[1];
+@@ -126,9 +157,10 @@ final class PictureInPictureFrame extends FrameLayout {
+ 
+   @Override
+   protected void onMeasure(int widthSpec, int heightSpec) {
+-    if (!compact || viewportWidth <= 0 || viewportHeight <= 0) {
++    boolean reflows = PictureInPicturePolicy.reflowsWithWindow(compact, frozen);
++    if (reflows || !frozenBasisReady()) {
+       super.onMeasure(widthSpec, heightSpec);
+-      if (!frozen && !compact) {
++      if (reflows) {
+         androidx.core.view.WindowInsetsCompat insets =
+             androidx.core.view.ViewCompat.getRootWindowInsets(this);
+         if (insets == null || !insets.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())) {
+@@ -138,8 +170,7 @@ final class PictureInPictureFrame extends FrameLayout {
+       }
+       return;
+     }
+-    int[] viewport =
+-        drawingViewport(MeasureSpec.getSize(widthSpec), MeasureSpec.getSize(heightSpec));
++    int[] viewport = drawingViewport();
+     if (viewport[0] != measuredChildWidth || viewport[1] != measuredChildHeight) {
+       for (int i = 0; i < getChildCount(); i++)
+         getChildAt(i)
+@@ -154,12 +185,12 @@ final class PictureInPictureFrame extends FrameLayout {
+ 
+   @Override
+   protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+-    if (!compact) {
++    if (PictureInPicturePolicy.reflowsWithWindow(compact, frozen) || !frozenBasisReady()) {
+       if (childTransformApplied) clearChildTransform();
+       super.onLayout(changed, left, top, right, bottom);
+       return;
+     }
+-    int[] viewport = drawingViewport(getWidth(), getHeight());
++    int[] viewport = drawingViewport();
+     float scale = PictureInPicturePolicy.scale(getWidth(), getHeight(), viewport[0], viewport[1]);
+     float tx = (getWidth() - viewport[0] * scale) / 2f;
+     float ty = (getHeight() - viewport[1] * scale) / 2f;
+diff --git a/app/src/main/java/com/deepseekharness/app/ui/SkillsActivity.java b/app/src/main/java/com/deepseekharness/app/ui/SkillsActivity.java
+index a4b61e6..c35347d 100644
+--- a/app/src/main/java/com/deepseekharness/app/ui/SkillsActivity.java
++++ b/app/src/main/java/com/deepseekharness/app/ui/SkillsActivity.java
+@@ -347,7 +347,10 @@ public final class SkillsActivity extends AppCompatActivity {
+   }
+ 
+   private String resultText(Result result) {
+-    return switch (result.code) {
++    // 文件系统拒绝会附带「哪一级、哪种类型」（PARENT_LINK#7:LINK）；归类仍按 PARENT_LINK 处理。
++    String code =
++        result.code != null && result.code.startsWith("PARENT_LINK") ? "PARENT_LINK" : result.code;
++    return switch (code) {
+       case "READY" ->
+           t("选择技能文件后可查看内容并复制调用命令。", "Select a skill to view its contents and copy its invocation.");
+       case "READING" -> t("正在读取用户技能…", "Reading user skills…");
+diff --git a/app/src/main/java/com/deepseekharness/app/ui/WebFilePick.java b/app/src/main/java/com/deepseekharness/app/ui/WebFilePick.java
+new file mode 100644
+index 0000000..cc66e05
+--- /dev/null
++++ b/app/src/main/java/com/deepseekharness/app/ui/WebFilePick.java
+@@ -0,0 +1,144 @@
++package com.deepseekharness.app.ui;
++
++import android.content.Context;
++import android.content.Intent;
++import android.database.Cursor;
++import android.net.Uri;
++import android.provider.OpenableColumns;
++import com.deepseekharness.app.util.UiText;
++import com.deepseekharness.app.util.WebTransferPolicy;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.List;
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
++
++/**
++ * 「打开方式」附件桥（网页侧 `window.DSHA.pickFile`）的原生部分：Intent 组装、内容 URI 的有界读取与回执 JSON。
++ *
++ * <p>形态：必须 `Intent.createChooser` 包一层再 launch。直接 launch `ACTION_OPEN_DOCUMENT` /
++ * `ACTION_GET_CONTENT` 会让默认处理者（真机上是文件管理）独占，用户看不到应用列表。
++ *
++ * <p>回传：网页 `fetch` 不了 `content://`，`file://` 又被同源策略挡住，所以走 base64。
++ */
++final class WebFilePick {
++  /** 与宿主 intake 同一条数量上限。 */
++  static final int MAX_FILES = 20;
++
++  /**
++   * 单文件原文上限 4 MiB。
++   *
++   * <p>base64 约放大 4/3，而回执是**一条**必须能被网页整串 `JSON.parse` 的字符串：再大，WebView 桥、
++   * 网页内存与 `atob` 三处都会出现可感知的峰值。更大的附件走宿主 input 回落路径（宿主复制进私有缓存后
++   * 按 256 MiB 上限上传），所以这里超限直接报错，让插件回落到现状。
++   */
++  static final long MAX_FILE_BYTES = 4L * 1024 * 1024;
++
++  /** 一次请求的总原文上限，避免一次多选把网页内存顶满。 */
++  static final long MAX_TOTAL_BYTES = 8L * 1024 * 1024;
++
++  static final String MIME_ANY = "*/*";
++  private static final int MAX_ACCEPT = 16;
++  private static final int MAX_ACCEPT_LENGTH = 128;
++  private static final String[] REASON_CODES = {
++    "BAD_URI", "NO_STREAM", "FILE_TOO_LARGE", "TOTAL_TOO_LARGE"
++  };
++
++  private WebFilePick() {}
++
++  /** 系统「打开方式」列表；title 为空时用当前界面语言的默认标题。 */
++  static Intent chooser(List<String> accept, boolean multiple, String title) {
++    Intent pick =
++        new Intent(Intent.ACTION_OPEN_DOCUMENT)
++            .addCategory(Intent.CATEGORY_OPENABLE)
++            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
++    if (accept == null || accept.isEmpty()) {
++      pick.setType(MIME_ANY);
++    } else if (accept.size() == 1) {
++      pick.setType(accept.get(0));
++    } else {
++      pick.setType(MIME_ANY);
++      pick.putExtra(Intent.EXTRA_MIME_TYPES, accept.toArray(new String[0]));
++    }
++    if (multiple) pick.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
++    String label = title == null || title.isEmpty() ? UiText.choose("打开方式", "Open with") : title;
++    return Intent.createChooser(pick, label);
++  }
++
++  /** 请求里的 accept 白名单：只认 `type/subtype` 与通配，长度、条数都有界。 */
++  static List<String> accept(JSONArray types) {
++    List<String> list = new ArrayList<>();
++    if (types == null) return list;
++    for (int index = 0; index < types.length() && list.size() < MAX_ACCEPT; index++) {
++      String item = types.optString(index, "").trim();
++      if (item.isEmpty() || item.length() > MAX_ACCEPT_LENGTH) continue;
++      if (!MIME_ANY.equals(item) && !item.matches("[\\w.+-]+/(\\*|[\\w.+-]+)")) continue;
++      if (!list.contains(item)) list.add(item);
++    }
++    return list;
++  }
++
++  /** 内容 URI → `{name, mime, bytes, base64}`；只读上限内的字节。 */
++  static JSONObject read(Context context, Uri uri) throws IOException, JSONException {
++    if (uri == null || !"content".equals(uri.getScheme())) throw new IOException("BAD_URI");
++    String name = "attachment.bin";
++    try (Cursor cursor =
++        context
++            .getContentResolver()
++            .query(uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
++      if (cursor != null && cursor.moveToFirst())
++        name = WebTransferPolicy.fileName(cursor.getString(0));
++    } catch (RuntimeException error) {
++      // 取显示名失败不阻断读取：文件名只用于网页展示，不参与宿主路径拼装。
++    }
++    String mime = context.getContentResolver().getType(uri);
++    if (mime == null || mime.isEmpty()) mime = "application/octet-stream";
++    byte[] data;
++    try (InputStream input = context.getContentResolver().openInputStream(uri)) {
++      if (input == null) throw new IOException("NO_STREAM");
++      data = bounded(input, MAX_FILE_BYTES);
++    }
++    return new JSONObject()
++        .put("name", name)
++        .put("mime", mime)
++        .put("bytes", data.length)
++        .put("base64", android.util.Base64.encodeToString(data, android.util.Base64.NO_WRAP));
++  }
++
++  /** 多读一字节判超限：上限外的内容不进内存。 */
++  private static byte[] bounded(InputStream input, long limit) throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    byte[] buffer = new byte[65536];
++    long total = 0;
++    int read;
++    while ((read = input.read(buffer)) != -1) {
++      total += read;
++      if (total > limit) throw new IOException("FILE_TOO_LARGE");
++      out.write(buffer, 0, read);
++    }
++    return out.toByteArray();
++  }
++
++  /** 回执 JSON；任何失败都退化成可辨识的 detail，不让回执本身抛异常。 */
++  static String payload(String id, boolean ok, JSONArray files, String detail) {
++    try {
++      JSONObject value = new JSONObject().put("v", 1).put("ok", ok);
++      if (id != null) value.put("id", id);
++      if (ok) value.put("files", files == null ? new JSONArray() : files);
++      else value.put("detail", detail == null || detail.isEmpty() ? "PICK_FAILED" : detail);
++      return value.toString();
++    } catch (JSONException error) {
++      return "{\"v\":1,\"ok\":false,\"detail\":\"PICK_FAILED\"}";
++    }
++  }
++
++  /** 失败原因：已知错误码原样透出，未知异常不把宿主细节带进网页。 */
++  static String reason(Exception error) {
++    String message = error == null ? null : error.getMessage();
++    if (message != null) for (String code : REASON_CODES) if (code.equals(message)) return code;
++    return "PICK_FAILED";
++  }
++}
+diff --git a/app/src/main/java/com/deepseekharness/app/ui/WebPageScripts.java b/app/src/main/java/com/deepseekharness/app/ui/WebPageScripts.java
+index 869a1d2..bce5427 100644
+--- a/app/src/main/java/com/deepseekharness/app/ui/WebPageScripts.java
++++ b/app/src/main/java/com/deepseekharness/app/ui/WebPageScripts.java
+@@ -26,6 +26,9 @@ public final class WebPageScripts {
+         + "\n"
+         + read(context, "bridge-token-compat.cjs")
+         + "\n"
++        // 附件选择桥的网页侧：window.DSHA.pickFile，配合同源注入的 DshaFiles 对象使用。
++        + read(context, "web-integration/files.js")
++        + "\n"
+         + read(context, "web-integration/startup.js");
+   }
+ 
+diff --git a/app/src/main/java/com/deepseekharness/app/ui/WebPreviewActivity.java b/app/src/main/java/com/deepseekharness/app/ui/WebPreviewActivity.java
+index 0daebb1..2a94e4c 100644
+--- a/app/src/main/java/com/deepseekharness/app/ui/WebPreviewActivity.java
++++ b/app/src/main/java/com/deepseekharness/app/ui/WebPreviewActivity.java
+@@ -32,6 +32,10 @@ import com.deepseekharness.app.R;
+ import com.deepseekharness.app.util.Constants;
+ import com.deepseekharness.app.util.PreviewPageSession;
+ import com.deepseekharness.app.util.WebPreviewPolicy;
++import java.io.IOException;
++import org.json.JSONArray;
++import org.json.JSONException;
++import org.json.JSONObject;
+ 
+ /** 标准版预览：系统 WebView、异步鉴权、文件选择与可恢复的加载错误。 */
+ public class WebPreviewActivity extends PictureInPictureActivity implements WebFullscreenUi.Host {
+@@ -119,6 +123,48 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+     }
+   }
+ 
++  /**
++   * 网页 {@code window.DSHA.pickFile} 的一次待办请求。
++   *
++   * <p>与 {@link PendingUpload} 的区别：不经过宿主 hidden input，结果直接以 JSON 回执交给发起页；
++   * 回执通道是 {@code JavaScriptReplyProxy}，所以必须绑定发起时的页面身份，页面换代后不许再回。
++   */
++  private static final class PendingPick {
++    final WebView view;
++    final String id;
++    final androidx.webkit.JavaScriptReplyProxy reply;
++    final PreviewPageSession.Identity identity;
++    final String pickerKey = "dsha-web-pick-" + java.util.UUID.randomUUID();
++    ActivityResultLauncher<Intent> picker;
++    WebPreviewActivity pickerOwner;
++    final java.util.concurrent.atomic.AtomicBoolean completed =
++        new java.util.concurrent.atomic.AtomicBoolean();
++
++    PendingPick(
++        WebView view,
++        String id,
++        androidx.webkit.JavaScriptReplyProxy reply,
++        PreviewPageSession.Identity identity) {
++      this.view = view;
++      this.id = id;
++      this.reply = reply;
++      this.identity = identity;
++    }
++
++    /** 回执只发一次；`null` 表示页面已经不留了，静默丢弃。 */
++    boolean complete(String payload) {
++      if (!completed.compareAndSet(false, true)) return false;
++      if (payload != null) {
++        try {
++          reply.postMessage(payload);
++        } catch (RuntimeException ignored) {
++          // 页面已销毁 / 代理失效：这里不能再抛，否则会把 ActivityResult 回调带塌。
++        }
++      }
++      return true;
++    }
++  }
++
+   public static final class Retained extends androidx.lifecycle.ViewModel {
+     WebView view;
+     boolean ready;
+@@ -137,6 +183,8 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+     PendingUpload pendingUpload;
+     // 页面取消后仍等待旧系统结果排空，不能把它交给新页面的上传请求。
+     PendingUpload pendingPicker;
++    // 同一时刻只允许一个网页附件选择请求（与网页侧 pending.size 限制对应）。
++    PendingPick pendingPick;
+     WebUploads.Session uploadSession;
+     final com.deepseekharness.app.util.BrowserUploadRequestState<WebView, WebUploads.Session>
+         uploadRequests = new com.deepseekharness.app.util.BrowserUploadRequestState<>();
+@@ -154,6 +202,13 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+         pendingPicker.complete(null);
+         pendingPicker = null;
+       }
++      if (pendingPick != null) {
++        if (pendingPick.picker != null) pendingPick.picker.unregister();
++        pendingPick.picker = null;
++        pendingPick.pickerOwner = null;
++        pendingPick.complete(null);
++        pendingPick = null;
++      }
+       uploadRequests.close();
+       if (view != null) view.destroy();
+       view = null;
+@@ -284,6 +339,33 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+     }
+   }
+ 
++  /** 只注册、不 launch：旋转后重挂同一个待办请求也走这里。 */
++  private void registerFilePick(PendingPick request) {
++    if (request.picker != null) return;
++    request.pickerOwner = this;
++    request.picker =
++        getActivityResultRegistry()
++            .register(
++                request.pickerKey,
++                new ActivityResultContracts.StartActivityForResult(),
++                result -> finishFilePick(request, result));
++    // 无生命周期的注册可能同步交付旋转前暂存的结果，注册返回后再补一次释放。
++    if (retained.pendingPick != request) unregisterFilePick(request);
++  }
++
++  private void unregisterFilePick(PendingPick pending) {
++    if (pending != null && pending.pickerOwner == this && pending.picker != null) {
++      pending.picker.unregister();
++      pending.picker = null;
++      pending.pickerOwner = null;
++    }
++  }
++
++  /** 系统「打开方式」选择器的标题（按界面语言）。 */
++  private static String fileChooserTitle() {
++    return com.deepseekharness.app.util.UiText.choose("打开方式", "Open with");
++  }
++
+   public static Intent intent(Context ctx, String url, String cookie) {
+     return new Intent(ctx, WebPreviewActivity.class)
+         .putExtra(EXTRA_URL, url)
+@@ -383,6 +465,14 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+         cancelFileSelection();
+       }
+     }
++    if (retained.pendingPick != null) {
++      try {
++        registerFilePick(retained.pendingPick);
++      } catch (RuntimeException unavailable) {
++        unregisterFilePick(retained.pendingPick);
++        retained.pendingPick = null;
++      }
++    }
+   }
+ 
+   private void loadSession() {
+@@ -614,6 +704,30 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+             } catch (IllegalStateException ignored) {
+             }
+           });
++      // 附件桥：网页 window.DSHA 的 share/save/pickFile 都经这一个对象；162 树上还没有原生
++      // share/save，所以这里只认 action:'pick'，其余动作明确回 UNSUPPORTED_ACTION（不能让网页挂死）。
++      androidx.webkit.WebViewCompat.removeWebMessageListener(view, "DshaFiles");
++      androidx.webkit.WebViewCompat.addWebMessageListener(
++          view,
++          "DshaFiles",
++          java.util.Collections.singleton(baseUrl.substring(0, baseUrl.length() - 1)),
++          (source, message, origin, mainFrame, reply) -> {
++            if (!isCurrentPage(source)
++                || !mainFrame
++                || !WebPreviewPolicy.sameService(baseUrl, source.getUrl())) return;
++            String data;
++            try {
++              data = message.getData();
++            } catch (IllegalStateException ignored) {
++              replyPick(reply, WebFilePick.payload(null, false, null, "BAD_REQUEST"));
++              return;
++            }
++            if (data == null || data.length() > 8192) {
++              replyPick(reply, WebFilePick.payload(null, false, null, "BAD_REQUEST"));
++              return;
++            }
++            startFilePick(source, reply, data);
++          });
+     }
+     view.setWebViewClient(new PreviewClient());
+     view.setWebChromeClient(new PreviewChromeClient(view, microphoneRequests));
+@@ -900,7 +1014,8 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+       try {
+         registerFilePicker(pending);
+         primary = params.createIntent();
+-        pending.picker.launch(primary);
++        // 必须包一层系统「打开方式」：直接 launch createIntent() 会让默认处理者（文件管理）独占。
++        pending.picker.launch(WebUploads.chooser(primary, fileChooserTitle()));
+       } catch (RuntimeException e) {
+         try {
+           if (primary == null)
+@@ -911,7 +1026,8 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+                         Intent.EXTRA_ALLOW_MULTIPLE,
+                         params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE)
+                     .putExtra(Intent.EXTRA_MIME_TYPES, params.getAcceptTypes());
+-          pending.picker.launch(WebUploads.fallback(primary));
++          pending.picker.launch(
++              WebUploads.chooser(WebUploads.fallback(primary), fileChooserTitle()));
+         } catch (RuntimeException ignored) {
+           unregisterFilePicker(pending);
+           retained.pendingPicker = null;
+@@ -986,9 +1102,143 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+         });
+   }
+ 
++  /**
++   * 处理网页 {@code DshaFiles.postMessage} 里的 `action:'pick'`，弹系统「打开方式」。
++   *
++   * <p>失败一律回 `{ok:false, detail}`：网页侧把它当 reject，插件的回落链会把这一路交回宿主
++   * hidden input（那时宿主 input 也会弹 chooser），所以既不能静默，也不能在这里自己再弹一个。
++   */
++  private void startFilePick(
++      WebView view, androidx.webkit.JavaScriptReplyProxy reply, String json) {
++    JSONObject request;
++    try {
++      request = new JSONObject(json);
++    } catch (JSONException error) {
++      replyPick(reply, WebFilePick.payload(null, false, null, "BAD_REQUEST"));
++      return;
++    }
++    String id = request.optString("id", "");
++    if (id.isEmpty() || id.length() > 128) {
++      replyPick(reply, WebFilePick.payload(null, false, null, "BAD_REQUEST"));
++      return;
++    }
++    if (!"pick".equals(request.optString("action", ""))) {
++      replyPick(reply, WebFilePick.payload(id, false, null, "UNSUPPORTED_ACTION"));
++      return;
++    }
++    if (retained.pendingPick != null) {
++      replyPick(reply, WebFilePick.payload(id, false, null, "BUSY"));
++      return;
++    }
++    Intent chooser;
++    try {
++      chooser =
++          WebFilePick.chooser(
++              WebFilePick.accept(request.optJSONArray("accept")),
++              request.optBoolean("multiple", false),
++              request.optString("title", ""));
++    } catch (RuntimeException error) {
++      replyPick(reply, WebFilePick.payload(id, false, null, "PICKER_UNAVAILABLE"));
++      return;
++    }
++    PendingPick pending = new PendingPick(view, id, reply, retained.pageSession.identity());
++    retained.pendingPick = pending;
++    try {
++      registerFilePick(pending);
++    } catch (RuntimeException unavailable) {
++      retained.pendingPick = null;
++      replyPick(reply, WebFilePick.payload(id, false, null, "PICKER_UNAVAILABLE"));
++      return;
++    }
++    // 注册期间同步交付过结果（旋转前暂存）时不再 launch，否则会凭空弹第二个选择器。
++    if (retained.pendingPick != pending || pending.picker == null) return;
++    try {
++      pending.picker.launch(chooser);
++    } catch (RuntimeException error) {
++      unregisterFilePick(pending);
++      if (retained.pendingPick == pending) retained.pendingPick = null;
++      replyPick(reply, WebFilePick.payload(id, false, null, "PICKER_UNAVAILABLE"));
++    }
++  }
++
++  /** 选择器回来：取消 → 空清单；拿到内容 URI → 后台读成 base64 再回执。 */
++  private void finishFilePick(PendingPick pending, androidx.activity.result.ActivityResult result) {
++    unregisterFilePick(pending);
++    if (retained == null || retained.pendingPick != pending) {
++      pending.complete(null);
++      return;
++    }
++    retained.pendingPick = null;
++    if (!isCurrentPage(pending.view) || !retained.pageSession.isCurrent(pending.identity)) {
++      pending.complete(WebFilePick.payload(pending.id, false, null, "PAGE_GONE"));
++      return;
++    }
++    Uri[] selected = WebUploads.parseChooserResult(result.getResultCode(), result.getData());
++    if (selected == null || selected.length == 0) {
++      pending.complete(WebFilePick.payload(pending.id, true, null, null));
++      return;
++    }
++    if (selected.length > WebFilePick.MAX_FILES) {
++      pending.complete(WebFilePick.payload(pending.id, false, null, "TOO_MANY_FILES"));
++      return;
++    }
++    final Context app = getApplicationContext();
++    final PendingPick target = pending;
++    final PreviewPageSession.Identity identity = pending.identity;
++    final WebView source = pending.view;
++    new Thread(
++            () -> {
++              String payload;
++              try {
++                JSONArray files = new JSONArray();
++                long total = 0;
++                for (Uri uri : selected) {
++                  JSONObject file = WebFilePick.read(app, uri);
++                  total += file.getLong("bytes");
++                  if (total > WebFilePick.MAX_TOTAL_BYTES) throw new IOException("TOTAL_TOO_LARGE");
++                  files.put(file);
++                }
++                payload = WebFilePick.payload(target.id, true, files, null);
++              } catch (Exception error) {
++                payload = WebFilePick.payload(target.id, false, null, WebFilePick.reason(error));
++              }
++              final String ready = payload;
++              new android.os.Handler(android.os.Looper.getMainLooper())
++                  .post(
++                      () -> {
++                        // 读盘期间页面可能已经换代：回执必须绑定发起时的页面身份。
++                        if (!isCurrentPage(source) || !retained.pageSession.isCurrent(identity)) {
++                          target.complete(null);
++                          return;
++                        }
++                        target.complete(ready);
++                      });
++            },
++            "web-file-pick")
++        .start();
++  }
++
++  /** 页面不再接受这一路请求时按「取消」结算：绝不让插件回落到宿主 input 再弹一次。 */
++  private void cancelFilePick() {
++    if (retained == null || retained.pendingPick == null) return;
++    PendingPick pending = retained.pendingPick;
++    retained.pendingPick = null;
++    unregisterFilePick(pending);
++    pending.complete(WebFilePick.payload(pending.id, true, null, null));
++  }
++
++  private void replyPick(androidx.webkit.JavaScriptReplyProxy reply, String payload) {
++    try {
++      reply.postMessage(payload);
++    } catch (RuntimeException ignored) {
++      // 页面已销毁 / 代理失效。
++    }
++  }
++
+   private void cancelFileSelection() {
+     if (retained == null) return;
+     retained.uploadRequests.invalidate();
++    cancelFilePick();
+     if (retained.pendingUpload == null) return;
+     PendingUpload pending = retained.pendingUpload;
+     retained.pendingUpload = null;
+@@ -1126,6 +1376,7 @@ public class WebPreviewActivity extends PictureInPictureActivity implements WebF
+     if (microphoneRequests != null) microphoneRequests.cancel();
+     if (microphone != null) microphone.close();
+     if (retained != null) unregisterFilePicker(retained.pendingPicker);
++    if (retained != null) unregisterFilePick(retained.pendingPick);
+     if (retained != null && retained.owner.get() == this) retained.owner.clear();
+     cancelPendingAuthentication();
+     if (downloads != null) downloads.dismiss();
+diff --git a/app/src/main/java/com/deepseekharness/app/ui/WebUploads.java b/app/src/main/java/com/deepseekharness/app/ui/WebUploads.java
+index 9022305..0c4a569 100644
+--- a/app/src/main/java/com/deepseekharness/app/ui/WebUploads.java
++++ b/app/src/main/java/com/deepseekharness/app/ui/WebUploads.java
+@@ -356,6 +356,19 @@ public final class WebUploads {
+     return selected.isEmpty() ? null : selected.toArray(new Uri[0]);
+   }
+ 
++  /**
++   * 包一层系统「打开方式」（{@link Intent#createChooser}）再交给调用方 launch。
++   *
++   * `FileChooserParams.createIntent()` 给的是 `ACTION_GET_CONTENT`，直接 launch 会让默认处理者
++   * 独占（真机上是文件管理），用户看不到应用列表；这正是店主报障的形态。插件侧只能改 accept，
++   * 换不出 chooser（全通配 accept 与不写 accept 生成的 Intent 完全一致），所以形态只能在原生这里定。
++   * 已经是 chooser 的 Intent（部分内核会带 `EXTRA_INITIAL_INTENTS`）原样返回，不重复嵌套。
++   */
++  public static Intent chooser(Intent target, String title) {
++    if (target == null || Intent.ACTION_CHOOSER.equals(target.getAction())) return target;
++    return Intent.createChooser(target, title);
++  }
++
+   public static Intent fallback(Intent original) {
+     String alternative =
+         Intent.ACTION_GET_CONTENT.equals(original.getAction())
+diff --git a/app/src/main/java/com/deepseekharness/app/util/AdbWheelCache.java b/app/src/main/java/com/deepseekharness/app/util/AdbWheelCache.java
+index d09c137..fa27cbf 100644
+--- a/app/src/main/java/com/deepseekharness/app/util/AdbWheelCache.java
++++ b/app/src/main/java/com/deepseekharness/app/util/AdbWheelCache.java
+@@ -37,6 +37,43 @@ public final class AdbWheelCache {
+     }
+   }
+ 
++  /**
++   * glibc python 读取 wheel 的 dist-packages 目录。取法与 {@code adb-setup.sh} 的 SITE 一致
++   * （{@code site.getsitepackages()[0]} 即 {@code usr/local/lib/python<X.Y>/dist-packages}）：rootfs 里
++   * 存在的候选目录优先，都没有时返回带版本的首选目录，由安装流程按需创建。不要写死 Debian 的
++   * {@code usr/lib/python3/dist-packages} —— 本 rootfs 的 python 由随包 tarball 提供，该目录不存在，
++   * 写进去只会多出一层 python 不读取的目录。
++   */
++  public static File siteDir(File rootfsDir) {
++    List<String> candidates = siteCandidates(rootfsDir);
++    for (String candidate : candidates) {
++      File dir = new File(rootfsDir, candidate);
++      // 存在的目录直接用；不存在就交安装流程创建。被非目录项占用的位置留给文件系统按原样拒绝。
++      if (dir.isDirectory() || !dir.exists()) return dir;
++    }
++    return new File(rootfsDir, candidates.get(0));
++  }
++
++  /** 按 python 自身读取顺序给出候选：先 {@code usr/local/lib/python<X.Y>/dist-packages}。 */
++  private static List<String> siteCandidates(File rootfsDir) {
++    List<String> candidates = new ArrayList<>();
++    String version = pythonVersion(rootfsDir);
++    if (version != null) {
++      candidates.add("usr/local/lib/python" + version + "/dist-packages");
++      candidates.add("usr/lib/python" + version + "/dist-packages");
++    }
++    candidates.add("usr/lib/python3/dist-packages");
++    return candidates;
++  }
++
++  /** rootfs 里 glibc python 的主版本目录名（如 3.12）；查不到返回 null。 */
++  private static String pythonVersion(File rootfsDir) {
++    File[] dirs = new File(rootfsDir, "usr/lib").listFiles((d, n) -> n.matches("python3\\.[0-9]+"));
++    if (dirs == null || dirs.length == 0) return null;
++    Arrays.sort(dirs, Comparator.comparing(File::getName));
++    return dirs[dirs.length - 1].getName().substring("python".length());
++  }
++
+   /** APK 已在独立目录解开；现有同名条目（含坏文件、链接、目录）不会被替换。 */
+   public static Merge fillMissing(
+       BackupFileSystem fs, File bundled, File cache, File apkArchive, File cachedArchive)
+diff --git a/app/src/main/java/com/deepseekharness/app/util/PictureInPicturePolicy.java b/app/src/main/java/com/deepseekharness/app/util/PictureInPicturePolicy.java
+index 72a15d7..56a0c68 100644
+--- a/app/src/main/java/com/deepseekharness/app/util/PictureInPicturePolicy.java
++++ b/app/src/main/java/com/deepseekharness/app/util/PictureInPicturePolicy.java
+@@ -56,12 +56,33 @@ public final class PictureInPicturePolicy {
+     return new int[] {width, height};
+   }
+ 
+-  /** 保留网页的逻辑宽度，按小窗实际比例重排高度，避免不同系统窗口尺寸留下大片空白。 */
+-  public static int[] fittedViewport(
+-      int width, int height, int windowWidth, int windowHeight, String layout) {
+-    int[] preferred = viewport(width, height, layout);
+-    if (windowWidth <= 0 || windowHeight <= 0) return preferred;
+-    long fitted = Math.round((double) preferred[0] * windowHeight / windowWidth);
+-    return new int[] {preferred[0], (int) Math.max(1, Math.min(16384, fitted))};
++  /**
++   * 小窗（compact）与进入小窗前的过渡期（frozen）都必须沿用会话冻结视口，只有两者都关闭时才允许按
++   * 当前物理窗口尺寸重新测量 / 布局网页。过渡期若放行，Chromium 会按小窗物理宽度整页重排再被拉回，
++   * 表现为小窗下中部的可见闪烁。
++   */
++  public static boolean reflowsWithWindow(boolean compact, boolean frozen) {
++    return !(compact || frozen);
++  }
++
++  /**
++   * 小窗 / 过渡期的绘制视口：已有会话冻结视口就原样沿用；没有冻结视口时退回逻辑视口（而不是正在收缩
++   * 的小窗尺寸）。两者都不跟随窗口比例，因此冻结期内网页不会再被重新排版。
++   */
++  public static int[] frozenViewport(
++      int frozenWidth, int frozenHeight, int logicalWidth, int logicalHeight, String layout) {
++    if (frozenWidth > 0 && frozenHeight > 0) return new int[] {frozenWidth, frozenHeight};
++    return viewport(logicalWidth, logicalHeight, layout);
++  }
++
++  /** 逻辑视口是否已被小窗物理尺寸污染：两个方向都明显小于当前窗口（留 1/8 容差）。 */
++  public static boolean smallerThanWindow(
++      int width, int height, int windowWidth, int windowHeight) {
++    return width > 0
++        && height > 0
++        && windowWidth > 0
++        && windowHeight > 0
++        && (long) width * 8 < (long) windowWidth * 7
++        && (long) height * 8 < (long) windowHeight * 7;
+   }
+ }
+diff --git a/app/src/main/java/com/deepseekharness/app/util/VirtualScreenGenerationSync.java b/app/src/main/java/com/deepseekharness/app/util/VirtualScreenGenerationSync.java
+new file mode 100644
+index 0000000..e57639b
+--- /dev/null
++++ b/app/src/main/java/com/deepseekharness/app/util/VirtualScreenGenerationSync.java
+@@ -0,0 +1,28 @@
++package com.deepseekharness.app.util;
++
++/**
++ * 远端响应里的 generation 与本地管理器状态的合并规则；不依赖 Android。
++ *
++ * <p>只有改变 display 身份的动作（create 必然释放并重建 VirtualDisplay）可以把响应里的新
++ * generation 提交到本地；其余动作拿到不同 generation 说明请求与响应跨了代次，必须报过期。
++ */
++public final class VirtualScreenGenerationSync {
++  private VirtualScreenGenerationSync() {}
++
++  public enum Decision {
++    /** 响应与本代次一致（或缺省回落到本地值），不需要改动状态。 */
++    UNCHANGED,
++    /** display 身份改变的动作：先提交远端 generation，再评估其它检查。 */
++    COMMIT,
++    /** 请求与响应跨代次：必须拒绝，且不能改本地 generation。 */
++    STALE
++  }
++
++  public static Decision decide(String current, String returned, boolean displayChanging) {
++    if (returned == null
++        || returned.isEmpty()
++        || current == null
++        || current.equals(returned)) return Decision.UNCHANGED;
++    return displayChanging ? Decision.COMMIT : Decision.STALE;
++  }
++}
+diff --git a/app/src/main/java/com/deepseekharness/app/util/VirtualScreenPolicy.java b/app/src/main/java/com/deepseekharness/app/util/VirtualScreenPolicy.java
+index e91de25..38b9cb5 100644
+--- a/app/src/main/java/com/deepseekharness/app/util/VirtualScreenPolicy.java
++++ b/app/src/main/java/com/deepseekharness/app/util/VirtualScreenPolicy.java
+@@ -6,6 +6,12 @@ public final class VirtualScreenPolicy {
+ 
+   public static final int MIN_API = 30;
+ 
++  /** 观察帧的有效时间窗；画面静止时旧观察仍成立，只兜住像素未变的上下文变化。 */
++  public static final long OBSERVATION_TTL_MS = 30_000;
++
++  /** 观察后画面允许再变化多少帧；光标闪烁等无坐标影响的动画不应把整轮会话判死。 */
++  public static final long FRAME_LAG = 4;
++
+   public static boolean supported(int api) {
+     return api >= MIN_API;
+   }
+@@ -28,7 +34,18 @@ public final class VirtualScreenPolicy {
+     };
+   }
+ 
+-  public static boolean fresh(long observed, long current) {
+-    return observed > 0 && observed == current;
++  /**
++   * 有界时间窗内的最新帧：拒绝从未观察（{@code observed <= 0} 或 {@code observedAt <= 0}）、
++   * 超前于当前画面（{@code observed > sequence}）、落后超过 {@link #FRAME_LAG} 帧，或观察
++   * 时间超过 {@link #OBSERVATION_TTL_MS} 的帧。零容差等值判断会让光标闪烁（约 4 帧/秒）
++   * 把每次「看一眼再点」都判成 STALE_FRAME。
++   */
++  public static boolean recent(long observed, long sequence, long observedAt, long now) {
++    return observed > 0
++        && observedAt > 0
++        && observed <= sequence
++        && sequence - observed <= FRAME_LAG
++        && now >= observedAt
++        && now - observedAt <= OBSERVATION_TTL_MS;
+   }
+ }
+diff --git a/app/src/main/java/com/deepseekharness/app/vscreen/VirtualScreenCore.java b/app/src/main/java/com/deepseekharness/app/vscreen/VirtualScreenCore.java
+index f5475e2..8714065 100644
+--- a/app/src/main/java/com/deepseekharness/app/vscreen/VirtualScreenCore.java
++++ b/app/src/main/java/com/deepseekharness/app/vscreen/VirtualScreenCore.java
+@@ -217,6 +217,23 @@ public final class VirtualScreenCore {
+     return canonical;
+   }
+ 
++  /** tap/swipe 的位置来自帧内坐标；key/type/check 只依赖 display 上的焦点。 */
++  private static boolean coordinateAction(String path) {
++    return path.equals("/vscreen/tap") || path.equals("/vscreen/swipe");
++  }
++
++  /** 统一的有界时间窗帧栅栏：touch DOWN 与 tap/swipe 用同一口径，不再互相矛盾。 */
++  private static boolean recentFrame(Session session, long observed) {
++    return VirtualScreenPolicy.recent(
++        observed, session.sequence, session.observedAt, SystemClock.elapsedRealtime());
++  }
++
++  /** 一次输入最多消耗一次观察：之后必须重新 see 才能再动作。 */
++  private static void consume(Session session) {
++    session.observed = -1;
++    session.observedAt = 0;
++  }
++
+   private static String randomToken() {
+     byte[] bytes = new byte[24];
+     new java.security.SecureRandom().nextBytes(bytes);
+@@ -305,7 +322,7 @@ public final class VirtualScreenCore {
+         if (action == 0) {
+           synchronized (session.lock) {
+             long observed = Long.parseLong(q.getOrDefault("frameSeq", "-1"));
+-            if (!VirtualScreenPolicy.fresh(observed, session.sequence)) return error("STALE_FRAME");
++            if (!recentFrame(session, observed)) return error("STALE_FRAME");
+           }
+         }
+         return session.input.touch(stroke, action, x, y) ? status() : error("TOUCH_REJECTED");
+@@ -316,12 +333,11 @@ public final class VirtualScreenCore {
+       long observed = Long.parseLong(q.getOrDefault("frameSeq", "-1"));
+       synchronized (session.lock) {
+         if (!session.generation.equals(q.get("generation"))) return error("STALE_GENERATION");
+-        if (!VirtualScreenPolicy.fresh(observed, session.sequence)
+-            || observed != session.observed
+-            || SystemClock.elapsedRealtime() - session.observedAt > 30_000)
+-          return error("STALE_FRAME");
++        // 只有依赖帧内坐标的动作需要最新帧；type/key/check 由 display 上的焦点决定，
++        // 零容差等值判断会让「see 之后模型思考几秒再输入」必然失败。
++        if (coordinateAction(path) && !recentFrame(session, observed)) return error("STALE_FRAME");
+         if (path.equals("/vscreen/check")) {
+-          session.observed = -1;
++          consume(session);
+           return status();
+         }
+         if (session.input.active()) return error("TOUCH_IN_PROGRESS");
+@@ -334,7 +350,7 @@ public final class VirtualScreenCore {
+           int ms = tap ? 0 : Integer.parseInt(q.getOrDefault("ms", "300"));
+           if (ms < 0 || ms > 3000) return error("INVALID_DURATION");
+           String stroke = UUID.randomUUID().toString();
+-          session.observed = -1;
++          consume(session);
+           try {
+             if (!session.input.touch(stroke, 0, x, y)) return error("INPUT_REJECTED");
+             int steps = Math.max(1, ms / 16);
+@@ -352,7 +368,7 @@ public final class VirtualScreenCore {
+         if (path.equals("/vscreen/key")) {
+           int code = Integer.parseInt(q.getOrDefault("keycode", "-1"));
+           if (code != 3 && code != 4 && code != 66 && code != 67) return error("INVALID_KEY");
+-          session.observed = -1;
++          consume(session);
+           return session.input.key(code) ? status() : error("INPUT_REJECTED");
+         }
+         List<String> argv =
+@@ -368,7 +384,7 @@ public final class VirtualScreenCore {
+             return error("UNKNOWN_ROUTE");
+         }
+         // 消耗观察，执行失败或结果未知也不能重放同一动作。
+-        session.observed = -1;
++        consume(session);
+         Result r = exec(argv.toArray(new String[0]));
+         if (r.unknown) return error("INPUT_RESULT_UNKNOWN");
+         if (r.exit != 0 || r.text.contains("Error") || r.text.contains("Exception"))
+@@ -440,8 +456,12 @@ public final class VirtualScreenCore {
+     long seq, captured;
+     synchronized (session.lock) {
+       if (session.frame == null) return error("FRAME_NOT_READY");
+-      if (since == session.sequence && session.generation.equals(generation))
++      if (since == session.sequence && session.generation.equals(generation)) {
++        // 同一帧的重复观察也要重新计时，否则 unchanged 响应会烧掉时间窗并使后续动作过期。
++        session.observed = session.sequence;
++        session.observedAt = SystemClock.elapsedRealtime();
+         return status().put("unchanged", true).put("frameSeq", session.sequence);
++      }
+       copy = session.frame.copy(Bitmap.Config.ARGB_8888, false);
+       seq = session.sequence;
+       captured = session.capturedAt;
+diff --git a/app/src/main/java/com/deepseekharness/app/vscreen/VirtualScreenManager.java b/app/src/main/java/com/deepseekharness/app/vscreen/VirtualScreenManager.java
+index b5ba03f..00115d9 100644
+--- a/app/src/main/java/com/deepseekharness/app/vscreen/VirtualScreenManager.java
++++ b/app/src/main/java/com/deepseekharness/app/vscreen/VirtualScreenManager.java
+@@ -7,6 +7,7 @@ import com.deepseekharness.app.BuildConfig;
+ import com.deepseekharness.app.DshaApp;
+ import com.deepseekharness.app.util.OneShotLaunchAuthority;
+ import com.deepseekharness.app.util.ShellQuote;
++import com.deepseekharness.app.util.VirtualScreenGenerationSync;
+ import com.deepseekharness.app.util.VirtualScreenRequestFence;
+ import java.net.HttpURLConnection;
+ import java.net.URLEncoder;
+@@ -209,20 +210,28 @@ public final class VirtualScreenManager {
+       query += (query.isEmpty() ? "" : "&") + "expectedPackage=" + encode(snapshot.target);
+     JSONObject value = requestAt(snapshot.identity.port, snapshot.identity.token, route, query);
+     // Grant revision and target checks may use platform calls; keep them outside LOCK too.
+-    if (!authorized(snapshot.authority)) return failure("SCREEN_TARGET_CHANGED");
++    // create 会销毁旧 display：动作成功后再复核旧 target 只会误判成 SCREEN_TARGET_CHANGED，
++    // 这类动作只保留管理器自身的 epoch/revision 栅栏。
++    boolean permitted = displayChanging(route) || authorized(snapshot.authority);
+     synchronized (LOCK) {
+       if (!currentLocked(snapshot)) return failure("VSCREEN_REVOKED");
+-      if (!value.optBoolean("ok")) {
+-        lastError = value.optString("error");
+-        return value;
+-      }
++      // 先提交远端返回的新 generation，再评估其余检查：否则后续任一检查失败都会丢掉已经
++      // 生效的远端结果，管理器停留在旧 generation 上，之后 status/see 永久失步。
+       String returned = value.optString("generation", generation);
+-      if (!generation.equals(returned)) {
+-        if (!changeGeneration) return failure("STALE_GENERATION");
++      VirtualScreenGenerationSync.Decision decision =
++          VirtualScreenGenerationSync.decide(generation, returned, changeGeneration);
++      if (decision == VirtualScreenGenerationSync.Decision.STALE)
++        return failure("STALE_GENERATION");
++      if (decision == VirtualScreenGenerationSync.Decision.COMMIT) {
+         generation = returned;
+         stateRevision++;
+         frameSequence = -1;
+       }
++      if (!permitted) return failure("SCREEN_TARGET_CHANGED");
++      if (!value.optBoolean("ok")) {
++        lastError = value.optString("error");
++        return value;
++      }
+       long sequence = value.optLong("frameSeq", -1);
+       if (sequence >= 0
+           && sequence < frameSequence
+@@ -236,6 +245,11 @@ public final class VirtualScreenManager {
+     }
+   }
+ 
++  /** create 必然释放并重建 VirtualDisplay，因此不能用动作前的目标身份复核它。 */
++  private static boolean displayChanging(String route) {
++    return route.equals("/vscreen/create");
++  }
++
+   private JSONObject missingSnapshot(String requiredGeneration) {
+     synchronized (LOCK) {
+       if (requiredGeneration != null
+diff --git a/app/src/test/java/com/deepseekharness/app/util/PictureInPicturePolicyTest.java b/app/src/test/java/com/deepseekharness/app/util/PictureInPicturePolicyTest.java
+index 9b32eae..1cad1ed 100644
+--- a/app/src/test/java/com/deepseekharness/app/util/PictureInPicturePolicyTest.java
++++ b/app/src/test/java/com/deepseekharness/app/util/PictureInPicturePolicyTest.java
+@@ -5,18 +5,40 @@ import static org.junit.Assert.*;
+ 
+ public class PictureInPicturePolicyTest {
+   @Test
+-  public void actualWindowSizeReflowsHeightAndPreservesLogicalWidth() {
++  public void windowSizeOnlyReflowsOutsideCompactOrFrozenSession() {
++    assertTrue(PictureInPicturePolicy.reflowsWithWindow(false, false));
++    assertFalse(PictureInPicturePolicy.reflowsWithWindow(true, false));
++    // 过渡期（frozen 已置位、compact 还没置位）若放行 super.onMeasure/onLayout 就是闪烁根因。
++    assertFalse(PictureInPicturePolicy.reflowsWithWindow(false, true));
++    assertFalse(PictureInPicturePolicy.reflowsWithWindow(true, true));
++  }
++
++  @Test
++  public void frozenSessionKeepsOneLogicalViewportInsteadOfFollowingTheWindow() {
++    // 冻结期沿用会话冻结视口：小窗物理尺寸（270×360）不再让网页重排（旧实现重排成 1080×1440）。
+     assertArrayEquals(
+-        new int[] {1080, 1440},
+-        PictureInPicturePolicy.fittedViewport(1080, 2256, 270, 360, "auto"));
++        new int[] {1080, 2256},
++        PictureInPicturePolicy.frozenViewport(1080, 2256, 1080, 2256, "auto"));
++    // 没有冻结视口时退回逻辑视口，也不能被小窗尺寸带走。
+     assertArrayEquals(
+-        new int[] {2256, 1269},
+-        PictureInPicturePolicy.fittedViewport(1080, 2256, 480, 270, "landscape"));
++        new int[] {1080, 2256}, PictureInPicturePolicy.frozenViewport(-1, -1, 1080, 2256, "auto"));
++    // 手动横屏仍沿用冻结时选定的方向。
+     assertArrayEquals(
+-        new int[] {1080, 2256}, PictureInPicturePolicy.fittedViewport(1080, 2256, 0, 0, "auto"));
++        new int[] {2256, 1080},
++        PictureInPicturePolicy.frozenViewport(2256, 1080, 1080, 2256, "landscape"));
+     assertArrayEquals(
+-        new int[] {1080, 16384},
+-        PictureInPicturePolicy.fittedViewport(1080, 2256, 1, Integer.MAX_VALUE, "auto"));
++        new int[] {1080, 2256},
++        PictureInPicturePolicy.frozenViewport(-1, -1, 1080, 2256, "portrait"));
++  }
++
++  @Test
++  public void smallerThanWindowRejectsLogicalViewportsPoisonedByTheCompactWindow() {
++    assertTrue(PictureInPicturePolicy.smallerThanWindow(654, 1440, 1440, 2938));
++    assertFalse(PictureInPicturePolicy.smallerThanWindow(1080, 2256, 270, 360));
++    // 只有一个方向变小（旋转前的旧视口）不算污染，避免误拒横竖切换后的合法视口。
++    assertFalse(PictureInPicturePolicy.smallerThanWindow(1440, 2938, 2938, 1440));
++    assertFalse(PictureInPicturePolicy.smallerThanWindow(0, 0, 1440, 2938));
++    assertFalse(PictureInPicturePolicy.smallerThanWindow(1440, 2938, 0, 0));
+   }
+ 
+   @Test
+diff --git a/app/src/test/java/com/deepseekharness/app/util/VirtualScreenGenerationSyncTest.java b/app/src/test/java/com/deepseekharness/app/util/VirtualScreenGenerationSyncTest.java
+new file mode 100644
+index 0000000..2f2e3e1
+--- /dev/null
++++ b/app/src/test/java/com/deepseekharness/app/util/VirtualScreenGenerationSyncTest.java
+@@ -0,0 +1,39 @@
++package com.deepseekharness.app.util;
++
++import static org.junit.Assert.assertEquals;
++
++import org.junit.Test;
++
++public class VirtualScreenGenerationSyncTest {
++  @Test
++  public void commitsRemoteGenerationOnlyForDisplayChangingActions() {
++    assertEquals(
++        VirtualScreenGenerationSync.Decision.UNCHANGED,
++        VirtualScreenGenerationSync.decide("gen-a", "gen-a", false));
++    assertEquals(
++        VirtualScreenGenerationSync.Decision.UNCHANGED,
++        VirtualScreenGenerationSync.decide("gen-a", "gen-a", true));
++    // create 重建了 VirtualDisplay：远端新 generation 必须先提交，不能被判成过期。
++    assertEquals(
++        VirtualScreenGenerationSync.Decision.COMMIT,
++        VirtualScreenGenerationSync.decide("gen-a", "gen-b", true));
++    // 其余动作跨代次说明请求/响应错位：拒绝且不得改本地 generation。
++    assertEquals(
++        VirtualScreenGenerationSync.Decision.STALE,
++        VirtualScreenGenerationSync.decide("gen-a", "gen-b", false));
++  }
++
++  @Test
++  public void treatsMissingFieldsAsUnchanged() {
++    // 失败响应通常不带 generation：按原值处理，不能把错误响应当换代。
++    assertEquals(
++        VirtualScreenGenerationSync.Decision.UNCHANGED,
++        VirtualScreenGenerationSync.decide("gen-a", "", true));
++    assertEquals(
++        VirtualScreenGenerationSync.Decision.UNCHANGED,
++        VirtualScreenGenerationSync.decide("gen-a", null, true));
++    assertEquals(
++        VirtualScreenGenerationSync.Decision.UNCHANGED,
++        VirtualScreenGenerationSync.decide(null, "gen-a", true));
++  }
++}
+diff --git a/app/src/test/java/com/deepseekharness/app/util/VirtualScreenPolicyTest.java b/app/src/test/java/com/deepseekharness/app/util/VirtualScreenPolicyTest.java
+index 9d703cf..2139e2e 100644
+--- a/app/src/test/java/com/deepseekharness/app/util/VirtualScreenPolicyTest.java
++++ b/app/src/test/java/com/deepseekharness/app/util/VirtualScreenPolicyTest.java
+@@ -18,7 +18,25 @@ public class VirtualScreenPolicyTest {
+         new float[] {500f, 1000f}, VirtualScreenPolicy.map(50, 100, 100, 100, 1000, 1000), 0.001f);
+     assertArrayEquals(
+         new float[] {0f, 1000f}, VirtualScreenPolicy.map(-1, 200, 100, 100, 1000, 1000), 0.001f);
+-    assertTrue(VirtualScreenPolicy.fresh(4, 4));
+-    assertFalse(VirtualScreenPolicy.fresh(3, 4));
++  }
++
++  @Test
++  public void acceptsBoundedFrameLagButNotTrulyStaleFrames() {
++    // see 之后光标闪烁把帧号推进几帧（约 4 帧/秒）仍然可以动作。
++    assertTrue(VirtualScreenPolicy.recent(7, 7, 1_000, 1_200));
++    assertTrue(VirtualScreenPolicy.recent(7, 7 + VirtualScreenPolicy.FRAME_LAG, 1_000, 1_200));
++    // 落后超过 FRAME_LAG、或超前于当前画面：真正的过期/伪造帧必须拒绝。
++    assertFalse(VirtualScreenPolicy.recent(7, 8 + VirtualScreenPolicy.FRAME_LAG, 1_000, 1_200));
++    assertFalse(VirtualScreenPolicy.recent(12, 7, 1_000, 1_200));
++    // 从未观察（新会话或动作已消耗观察）、观察到画面建立之前、观察超出时间窗。
++    assertFalse(VirtualScreenPolicy.recent(0, 7, 1_000, 1_200));
++    assertFalse(VirtualScreenPolicy.recent(-1, 7, 1_000, 1_200));
++    assertFalse(VirtualScreenPolicy.recent(7, 7, 0, 1_200));
++    assertFalse(
++        VirtualScreenPolicy.recent(
++            7, 7, 1_000, 1_000 + VirtualScreenPolicy.OBSERVATION_TTL_MS + 1));
++    // 画面静止时旧观察仍然有效：时间窗只兜住像素未变的上下文变化。
++    assertTrue(
++        VirtualScreenPolicy.recent(7, 7, 1_000, 1_000 + VirtualScreenPolicy.OBSERVATION_TTL_MS));
+   }
+ }
+diff --git a/tools/java-format-files.json b/tools/java-format-files.json
+index a24bb67..a2b0537 100644
+--- a/tools/java-format-files.json
++++ b/tools/java-format-files.json
+@@ -330,6 +330,7 @@
+     "app/src/main/java/com/deepseekharness/app/ui/WebBlobDownload.java",
+     "app/src/main/java/com/deepseekharness/app/ui/WebDownloadModel.java",
+     "app/src/main/java/com/deepseekharness/app/ui/WebDownloads.java",
++    "app/src/main/java/com/deepseekharness/app/ui/WebFilePick.java",
+     "app/src/main/java/com/deepseekharness/app/ui/WebFrameRate.java",
+     "app/src/main/java/com/deepseekharness/app/ui/WebFullscreenUi.java",
+     "app/src/main/java/com/deepseekharness/app/ui/WebPageScripts.java",

@@ -47,8 +47,37 @@ workflow 里 `actions/checkout` 拉 **DSH-APP/DSHA@70e37a7**（只读），然�
 * 这两条**不参与 APK 的字节内容**（`prepare-*-assets.py` 全都不读 descriptor），
   跳过只影响 descriptor 自校验，不影响打包用的资产。
 
+### 2.4 依赖校验锁只覆盖 Windows（新增一处补齐）
+`gradle/verification-metadata.xml` 是在 Windows 机器上生成的（全文 `-linux` 出现 **0** 次），
+只钉了 `aapt2-9.1.1-14792394-windows.jar`。Linux 上 AGP 通过内部 detached configuration
+解析 `aapt2-9.1.1-14792394-linux.jar`，strict 依赖校验直接失败：
+
+```
+> Dependency verification failed for configuration ':app:detachedConfiguration2'
+  One artifact failed verification: aapt2-9.1.1-14792394-linux.jar (com.android.tools.build:aapt2:9.1.1-14792394) from repository Google
+```
+
+处理方式：**没有**用 `--dependency-verification=off|lenient` 整体放水，也**没有**用
+`--write-verification-metadata` 无脑接受解析结果，而是由 `ci/patch-verification-metadata.py`
+只补这一条，摘要另行从 Google Maven 离线取回并核对：
+
+```
+https://dl.google.com/dl/android/maven2/com/android/tools/build/aapt2/9.1.1-14792394/aapt2-9.1.1-14792394-linux.jar
+sha256 e7ae17af6e4093c771243e82d66462353de87befaac206bfb43e557ac1c34440   (2,331,128 B)
+```
+
+其余仍为 strict：已钉的条目一个没动，任何**其他**未登记产物依旧会让构建失败。
+（副作用提示：上游自己的 `.github/workflows/ci-package.yml` 也是 `runs-on: ubuntu-24.04`，
+按同样逻辑应该会撞到这里 —— 说明该 workflow 可能从未在 Linux 上真正跑通过。）
+
 ### 2.3 其他
 * 不装 NDK（本仓库无 native 编译，`jniLibs` 是预编译的）。
+* runner 镜像（`ubuntu-24.04`，镜像版本 `20260927.320`）**完全没有预装 Android SDK**，
+  `sdkmanager: command not found`（exit 127）。workflow 里显式下载
+  `commandlinetools-linux-16111833_latest.zip`（sha256
+  `0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8`）解到
+  `$HOME/android-sdk/cmdline-tools/latest`，再装 `platforms;android-37.0` +
+  `build-tools;36.0.0`。**不假设 runner 自带 SDK。**
 * 不用发布密钥；debug 用 Android 标准 debug keystore 自动签名 → 可直接安装。
 * `applicationId` 是 `com.dsh.client`，与已装机的 `com.dsh.clienu` 不同包名，可并存。
 * 新增一个 `fix-unit-tests` job（`continue-on-error`），额外跑

@@ -60,6 +60,14 @@ jobs:
           set -euo pipefail
           git apply --verbose "${GITHUB_WORKSPACE}/ci/patches/dsha-four-fixes.patch"
           git status --short
+      # The checked-in lock was generated on Windows and pins only
+      # aapt2-*-windows.jar (0 "-linux" artifacts in the whole file). On Linux,
+      # AGP resolves aapt2-*-linux.jar in a detached configuration and strict
+      # verification rejects it. Add exactly that one entry instead of
+      # weakening verification for the whole build.
+      - name: Add the Linux AAPT2 checksum to the dependency-verification lock
+        working-directory: dsha
+        run: python3 "${GITHUB_WORKSPACE}/ci/patch-verification-metadata.py"
       - name: Verify toolchain against source configuration
         id: toolchain
         working-directory: dsha
@@ -152,6 +160,14 @@ jobs:
         run: |
           set -euo pipefail
           git apply --verbose "${GITHUB_WORKSPACE}/ci/patches/dsha-four-fixes.patch"
+      # The checked-in lock was generated on Windows and pins only
+      # aapt2-*-windows.jar (0 "-linux" artifacts in the whole file). On Linux,
+      # AGP resolves aapt2-*-linux.jar in a detached configuration and strict
+      # verification rejects it. Add exactly that one entry instead of
+      # weakening verification for the whole build.
+      - name: Add the Linux AAPT2 checksum to the dependency-verification lock
+        working-directory: dsha
+        run: python3 "${GITHUB_WORKSPACE}/ci/patch-verification-metadata.py"
       - name: Verify toolchain against source configuration
         id: toolchain
         working-directory: dsha
@@ -245,6 +261,14 @@ jobs:
         run: |
           set -euo pipefail
           git apply --verbose "${GITHUB_WORKSPACE}/ci/patches/dsha-four-fixes.patch"
+      # The checked-in lock was generated on Windows and pins only
+      # aapt2-*-windows.jar (0 "-linux" artifacts in the whole file). On Linux,
+      # AGP resolves aapt2-*-linux.jar in a detached configuration and strict
+      # verification rejects it. Add exactly that one entry instead of
+      # weakening verification for the whole build.
+      - name: Add the Linux AAPT2 checksum to the dependency-verification lock
+        working-directory: dsha
+        run: python3 "${GITHUB_WORKSPACE}/ci/patch-verification-metadata.py"
       - name: Verify toolchain against source configuration
         id: toolchain
         working-directory: dsha

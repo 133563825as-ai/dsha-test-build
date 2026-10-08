@@ -62,7 +62,16 @@ env:
   CMDLINE_TOOLS_URL: https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip
   CMDLINE_TOOLS_SHA256: 0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8
   # Certificate of the keystore pinned in this repo; every build must match it.
-  PINNED_CERT_SHA256: fc9f42df825a203f7d2b1e8913bda0353a47b386fcba4fb5718860e01ac39eae
+  PINNED_CERT_SHA256: da8c31abfe62a6b23b049c6e4b7b22eb41f3afc1025e393fc5a3f272e3b90990
+  # AGP 9's DebugSigningConfig uses alias "AndroidDebugKey" and
+  # KeyStore.getDefaultType() (pkcs12 on JDK 17); ci/debug.keystore matches
+  # those exactly, and the same values are also passed explicitly through
+  # android.injected.signing.* so the signature does not depend on AGP's
+  # debug-keystore location resolution.
+  KEYSTORE_ALIAS: AndroidDebugKey
+  KEYSTORE_PASSWORD: android
+  KEYSTORE_STORE_TYPE: pkcs12
+  KEYSTORE_FILE: ${{ github.workspace }}/ci/debug.keystore
 
 jobs:
   standard-debug:
@@ -112,11 +121,16 @@ jobs:
       - name: Install the pinned debug keystore
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.android"
-          install -m 600 "${GITHUB_WORKSPACE}/ci/debug.keystore" "$HOME/.android/debug.keystore"
-          echo "keystore sha256: $(sha256sum "$HOME/.android/debug.keystore" | cut -d' ' -f1)"
-          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey \
-            | grep -iE "fingerprint|SHA256" || true
+          mkdir -p "$HOME/.android" "${GRADLE_USER_HOME:-$HOME/.gradle}/.android"
+          install -m 600 "$KEYSTORE_FILE" "$HOME/.android/debug.keystore"
+          install -m 600 "$KEYSTORE_FILE" "${GRADLE_USER_HOME:-$HOME/.gradle}/.android/debug.keystore"
+          for f in "$HOME/.android/debug.keystore" "${GRADLE_USER_HOME:-$HOME/.gradle}/.android/debug.keystore"; do
+            echo "$f"
+            echo "  sha256: $(sha256sum "$f" | cut -d' ' -f1)"
+            keytool -list -v -keystore "$f" -storepass "$KEYSTORE_PASSWORD" -alias "$KEYSTORE_ALIAS" 2>/dev/null \
+              | grep -E "Alias name|Store type|SHA256:" | sed 's/^/  /' || true
+          done
+          test "$(sha256sum "$KEYSTORE_FILE" | cut -d' ' -f1)" = "0fa7eded93c8a3a77ff096cd49e50a1b79c677b05a83a141dfb313b41654dc66"
       # The ubuntu-24.04 image used here has no Android SDK on PATH at all
       # (sdkmanager -> command not found), so install cmdline-tools explicitly.
       - name: Install Android SDK command-line tools
@@ -156,6 +170,11 @@ jobs:
           ./gradlew :app:assembleStandardDebug \
             -x :app:verifyRuntimeDescriptorInputs \
             -x :app:prepareRuntimeDescriptor \
+            -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEYSTORE_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.store.type="$KEYSTORE_STORE_TYPE" \
             --no-daemon --max-workers=2 --stacktrace 2>&1 | tee "${GITHUB_WORKSPACE}/assemble-standard-debug.log"
       - name: Collect APK facts and assert the pinned signer
         if: success()
@@ -186,6 +205,18 @@ jobs:
         run: |
           find dsha/app/build/outputs/apk -name '*.apk' -printf '%s\t%p\n' 2>/dev/null | sort -n || true
           find dsha/app/build/outputs/apk -name '*.apk' -exec sha256sum {} + 2>/dev/null || true
+      # Diagnostic: prove which debug keystore AGP actually resolved, and
+      # whether it created one somewhere else instead of using the pinned copy.
+      - name: Locate every debug keystore on the runner
+        if: always()
+        run: |
+          echo "HOME=$HOME  GRADLE_USER_HOME=${GRADLE_USER_HOME:-<unset>}  USER=$(id -un)"
+          find /home /root /opt /usr/local /tmp -name 'debug.keystore' 2>/dev/null | while read -r f; do
+            echo "$(sha256sum "$f" | cut -d' ' -f1)  $f"
+            keytool -list -v -keystore "$f" -storepass "$KEYSTORE_PASSWORD" 2>/dev/null \
+              | grep -E "Alias name|Store type|SHA256:" | sed 's/^/      /' || true
+          done
+          grep -iE "debug keystore|keystore" "${GITHUB_WORKSPACE}/assemble-standard-debug.log" | head -20 || true
       - name: Publish the standard APK as a GitHub Release
         if: success()
         env:

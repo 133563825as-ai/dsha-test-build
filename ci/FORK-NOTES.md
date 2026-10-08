@@ -25,15 +25,30 @@ workflow 里 `actions/checkout` 拉 **DSH-APP/DSHA@70e37a7**（只读），然�
   （历史说明：run 37771605280 曾同时产出 standard + low 两份，
   `app-standard-debug.apk` 290,849,194 B / `app-low-debug.apk` 371,606,024 B，
   签名者证书不同，因为 standard / low 跑在不同 runner、各自现生成 debug.keystore。）
-* **debug keystore 固定**：`ci/debug.keystore`（JKS，alias `androiddebugkey`，
-  store/key pass `android`，`CN=Android Debug`，有效期至 2054），构建前
-  `install -m 600` 到 `$HOME/.android/debug.keystore`，AGP 的默认 debug 签名配置就会用它。
-  * 文件 sha256：`f5159a89f0bece07ffccbede9a3939a5afe4d6c0d7e3196adf73dd84c48b4ec0`
-  * **证书 SHA-256：`fc9f42df825a203f7d2b1e8913bda0353a47b386fcba4fb5718860e01ac39eae`**
+* **debug keystore 固定**：`ci/debug.keystore`。
+  * 参数刻意与 **AGP 9.1.1 自己的 `DebugSigningConfig`** 对齐（反编译 `com.android.tools.build:builder:9.1.1`
+    的 `DefaultSigningConfig$DebugSigningConfig` / `GradleKeystoreHelper` 得到）：
+    `storeType = KeyStore.getDefaultType()`（JDK 17 = **pkcs12**）、`storePassword = android`、
+    **`keyAlias = AndroidDebugKey`**（注意是大写 A/D/K，不是历史上那个全小写的 `androiddebugkey`）、
+    `keyPassword = android`、DN `CN=Android Debug,O=Android,C=US`。
+  * 文件 sha256：`0fa7eded93c8a3a77ff096cd49e50a1b79c677b05a83a141dfb313b41654dc66`
+  * **证书 SHA-256：`da8c31abfe62a6b23b049c6e4b7b22eb41f3afc1025e393fc5a3f272e3b90990`**
   * 构建 job 里有一道硬断言：APK 的 `apksigner verify --print-certs` 结果必须等于这个值，
-    否则 job 失败。这样"后续包可覆盖安装"是**被验证的**，不是照抄的说法。
-  * 已用 JDK 17 实测该 JKS 能被 `KeyStore.getInstance("JKS")`、`"PKCS12"` 和默认类型
-    （pkcs12）三种方式加载，不依赖 AGP 用哪种 store type。
+    否则 job 直接失败（`test-1` 的第一次尝试就是被这道断言挡下来的，见下）。
+  * 双保险：既 `install -m 600` 到 `$HOME/.android/debug.keystore`（AGP 默认路径），
+    又显式传 `-Pandroid.injected.signing.store.file|store.password|key.alias|key.password|store.type`
+    —— 后者是 AGP 自己的一等机制（`StringOption.IDE_SIGNING_*` → `SigningConfigData.fromProjectOptions`），
+    不依赖 AGP 的 debug keystore 路径解析。
+  * 已实测该 pkcs12 store 能被 `KeyStore.getInstance("JKS")`、`"PKCS12"`、默认类型三种方式加载，
+    且 `getKey("AndroidDebugKey")` / `getKey("androiddebugkey")` 都能取到私钥。
+  * **踩坑记录（第一次失败）**：最初提交的是 JKS + alias `androiddebugkey` 的 keystore，
+    构建成功但断言失败 —— APK 的 signer cert 是 `578ec276…`，不是固定 keystore 的证书。
+    排查过程：反编译确认 AGP 的 alias 是 `AndroidDebugKey`、storeType 取 `KeyStore.getDefaultType()`；
+    但 Java 实测 alias 大小写不影响取私钥（JKS 与 pkcs12 回退读都大小写不敏感），
+    所以问题是 AGP 的 debug keystore **位置解析**（`AndroidPathLocator` 候选：
+    `ANDROID_USER_HOME`/`ANDROID_AVD_HOME`/`ANDROID_SDK_HOME`/`ANDROID_PREFS_ROOT`/`TEST_TMPDIR`/`USER_HOME`/`HOME`/`XDG_CONFIG_HOME`）
+    与 `$HOME/.android` 不一致，于是 AGP 在别处 `createIfAbsent` 造了一把新的。
+    因此加了 `Locate every debug keystore on the runner` 诊断步骤，并改走 injected signing。
   * 为什么必须固定：用户装机后首启要解压内置 Ubuntu（数分钟）。如果每次 runner 现生成
     keystore，签名就变，下一个包只能卸载重装 + 再等一次解压。
 * **发 GitHub Release**：standard APK 作为 release asset 上传，直链
@@ -42,9 +57,22 @@ workflow 里 `actions/checkout` 拉 **DSH-APP/DSHA@70e37a7**（只读），然�
 * **trigger 只有 `workflow_dispatch`**（去掉 push）：因为 tag / patch 必须显式指定，
   避免一次无关 push 把已有 tag 的 release 覆盖掉。
 
-## 3. 与官方 `ci-package.yml` 的偏离（如实记录）
+## 3. ⚠️ 基线版本错位（重要，务必随包说明）
 
-### 3.1 资产解包：用 `ci/unpack-inputs.py`，**没有**改上游 `tools/ci-assets.py`
+本 harness 目前把补丁打在 **DSH-APP/DSHA@70e37a7 = build 162** 上，而用户手机装的是
+**build 166**。所以 `test-1`（以及任何基于 162 的包）：
+
+1. 缺 162→166 之间新增的功能与资产（最典型是 `window.DSHA` 桥与
+   `app/src/main/assets/web-integration/files.js`），**这些修复在该包上本来就不会生效**；
+2. 自带插件/运行时资产也是 162 期的；
+3. 补丁验证的是 162 的行为，不是用户机上的行为。
+
+**因此 `test-1` 只能用于验证打包链路 + 签名 + 安装，不能当作四个修复的功能验收。**
+后续包需要先把补丁 rebase 到 166 的 main，届时 `UPSTREAM_COMMIT` 要一起换。
+
+## 4. 与官方 `ci-package.yml` 的偏离（如实记录）
+
+### 4.1 资产解包：用 `ci/unpack-inputs.py`，**没有**改上游 `tools/ci-assets.py`
 官方 `python3 tools/ci-assets.py --url ... --sha256 ...` 在本场景下必然失败：
 
 * `verify_sources()` 把 `NAMES` 里每个名字都对 `app/src/main/assets/runtime-descriptor.json`
@@ -60,7 +88,7 @@ workflow 里 `actions/checkout` 拉 **DSH-APP/DSHA@70e37a7**（只读），然�
 逐成员流式写出、不采用归档内路径、不写目录项、禁止符号链接父目录。
 额外增加：断言全部成员为 `ZIP_STORED`。
 
-### 3.2 跳过的 Gradle 门禁
+### 4.2 跳过的 Gradle 门禁
 ```
 -x :app:verifyRuntimeDescriptorInputs
 -x :app:prepareRuntimeDescriptor
@@ -72,7 +100,7 @@ workflow 里 `actions/checkout` 拉 **DSH-APP/DSHA@70e37a7**（只读），然�
 * 这两条**不参与 APK 的字节内容**（`prepare-*-assets.py` 全都不读 descriptor），
   跳过只影响 descriptor 自校验，不影响打包用的资产。
 
-### 3.3 依赖校验锁只覆盖 Windows（新增一处补齐）
+### 4.3 依赖校验锁只覆盖 Windows（新增一处补齐）
 `gradle/verification-metadata.xml` 是在 Windows 机器上生成的（全文 `-linux` 出现 **0** 次），
 只钉了 `aapt2-9.1.1-14792394-windows.jar`。Linux 上 AGP 通过内部 detached configuration
 解析 `aapt2-9.1.1-14792394-linux.jar`，strict 依赖校验直接失败：
@@ -95,7 +123,7 @@ sha256 e7ae17af6e4093c771243e82d66462353de87befaac206bfb43e557ac1c34440   (2,331
 （副作用提示：上游自己的 `.github/workflows/ci-package.yml` 也是 `runs-on: ubuntu-24.04`，
 按同样逻辑应该会撞到这里 —— 说明该 workflow 可能从未在 Linux 上真正跑通过。）
 
-### 3.4 其他
+### 4.4 其他
 * 不装 NDK（本仓库无 native 编译，`jniLibs` 是预编译的）。
 * runner 镜像（`ubuntu-24.04`，镜像版本 `20260927.320`）**完全没有预装 Android SDK**，
   `sdkmanager: command not found`（exit 127）。workflow 里显式下载
